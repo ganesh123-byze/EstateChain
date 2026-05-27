@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from decimal import Decimal
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -16,6 +16,7 @@ from backend.api._helpers import (
     ensure_security_token_sale_inventory,
     fetch_property,
     find_existing_property,
+    property_is_owned_by,
     get_total_minted_base,
     lock_property,
     property_needs_token_deployment,
@@ -25,7 +26,7 @@ from backend.api._helpers import (
 )
 
 LOGGER = logging.getLogger(__name__)
-from backend.api.deps import get_db, require_property_owner
+from backend.api.deps import get_db, get_optional_user, require_property_owner
 from backend.api.schemas import (
     IssueTokensRequest,
     MintNFTRequest,
@@ -162,8 +163,17 @@ def _assert_owner(user: AuthUser, property_item: dict) -> None:
     owner = normalize_address(property_item.get("owner_wallet") or "")
     if not owner:
         raise HTTPException(status_code=403, detail="Property owner not assigned.")
-    if owner != normalize_address(user.wallet_address):
+    if not property_is_owned_by(property_item, user.wallet_address):
         raise HTTPException(status_code=403, detail="You can only modify properties you own.")
+
+
+def _assert_property_owner_can_view(user: AuthUser, property_item: dict) -> None:
+    """Property owners may only read listings they created (by wallet)."""
+    owner = normalize_address(property_item.get("owner_wallet") or "")
+    if not owner:
+        raise HTTPException(status_code=403, detail="Property owner not assigned.")
+    if not property_is_owned_by(property_item, user.wallet_address):
+        raise HTTPException(status_code=403, detail="You can only view properties you own.")
 
 
 @router.post("/properties", response_model=PropertyRead)
@@ -197,8 +207,8 @@ def create_property(
                 db.commit()
                 _finalize_new_property(db, property_id)
                 cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-                return enrich_property_with_supply(cursor, cursor.fetchone())
-            return enrich_property_with_supply(cursor, existing_property)
+                return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
+            return enrich_property_with_supply(cursor, existing_property, viewer=user)
 
         cursor.execute(
             "INSERT INTO properties (name, location, total_value, token_supply, token_symbol, "
@@ -214,7 +224,7 @@ def create_property(
         db.commit()
         _finalize_new_property(db, property_id)
         cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone())
+        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
     except HTTPException:
         db.rollback()
         raise
@@ -275,7 +285,7 @@ async def create_property_stream(
                     property_id = int(existing["id"])
                     yield _sse({"step": "created", "property_id": property_id, "resuming_setup": True})
                 else:
-                    final = enrich_property_with_supply(cursor, existing)
+                    final = enrich_property_with_supply(cursor, existing, viewer=user)
                     yield _sse({"step": "done", "duplicate": True, "property": _json_safe_property(final)})
                     return
 
@@ -362,7 +372,7 @@ async def create_property_stream(
         cursor = db.cursor(dictionary=True)
         try:
             cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-            final = enrich_property_with_supply(cursor, cursor.fetchone())
+            final = enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("create_property_stream final fetch failed")
             yield _sse({"step": "error", "detail": str(exc)[:300]})
@@ -400,24 +410,50 @@ def _json_safe_property(prop: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/properties", response_model=list[PropertyRead])
-def list_properties(db=Depends(get_db)):
+def list_properties(
+    db=Depends(get_db),
+    user: Optional[AuthUser] = Depends(get_optional_user),
+):
+    """List active properties.
+
+    When the caller is authenticated as ``property_owner``, only properties
+    owned by that wallet are returned so the admin UI cannot surface another
+    owner's edit/delete controls.
+    """
     cursor = db.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT * FROM properties WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY id DESC")
+        if user and user.role.lower() == "property_owner":
+            owner_wallet = normalize_address(user.wallet_address)
+            cursor.execute(
+                "SELECT * FROM properties WHERE COALESCE(is_active, TRUE) = TRUE "
+                "AND LOWER(COALESCE(owner_wallet, '')) = %s "
+                "ORDER BY id DESC",
+                (owner_wallet,),
+            )
+        else:
+            cursor.execute(
+                "SELECT * FROM properties WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY id DESC",
+            )
         rows = cursor.fetchall()
-        return [enrich_property_with_supply(cursor, row) for row in rows]
+        return [enrich_property_with_supply(cursor, row, viewer=user) for row in rows]
     finally:
         cursor.close()
 
 
 @router.get("/properties/{property_id}", response_model=PropertyRead)
-def get_property(property_id: int, db=Depends(get_db)):
+def get_property(
+    property_id: int,
+    db=Depends(get_db),
+    user: Optional[AuthUser] = Depends(get_optional_user),
+):
     cursor = db.cursor(dictionary=True)
     try:
         property_item = fetch_property(cursor, property_id)
         if not property_item:
             raise HTTPException(status_code=404, detail="Property not found")
-        return enrich_property_with_supply(cursor, property_item)
+        if user and user.role.lower() == "property_owner":
+            _assert_property_owner_can_view(user, property_item)
+        return enrich_property_with_supply(cursor, property_item, viewer=user)
     finally:
         cursor.close()
 
@@ -467,7 +503,7 @@ def update_property(
         )
         db.commit()
         cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone())
+        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
     except HTTPException:
         db.rollback()
         raise
@@ -534,7 +570,7 @@ def deploy_property_token_endpoint(
         db.commit()
 
         cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone())
+        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
     except HTTPException:
         db.rollback()
         raise
@@ -569,7 +605,7 @@ def repair_sale_inventory(
         ensure_security_token_sale_inventory(prop)
         db.commit()
         cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone())
+        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
     except HTTPException:
         db.rollback()
         raise
@@ -658,7 +694,7 @@ def mint_nft(
         )
         db.commit()
         cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone())
+        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
     except Exception:
         db.rollback()
         raise
@@ -699,7 +735,7 @@ def issue_tokens(
 
         db.commit()
         cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone())
+        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
     except Exception:
         db.rollback()
         raise
@@ -732,7 +768,7 @@ def transfer_tokens(
 
         db.commit()
         cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone())
+        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
     except Exception:
         db.rollback()
         raise

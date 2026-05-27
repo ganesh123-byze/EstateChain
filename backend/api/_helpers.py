@@ -8,10 +8,15 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import HTTPException
 
 from backend.api.schemas import PropertyCreate
+from backend.services.auth import normalize_address
+
+if TYPE_CHECKING:
+    from backend.services.auth import AuthUser
 from backend.config.settings import RENT_TOKEN_DECIMALS, TOKEN_DECIMALS
 from backend.services.blockchain import (
     add_investors_to_rent,
@@ -94,7 +99,42 @@ def find_existing_property(
 
 # ── Enrichment / formatting ───────────────────────────────────────────
 
-def enrich_property_with_supply(cursor, property_item: dict) -> dict:
+def property_is_owned_by(property_item: dict, wallet: str) -> bool:
+    """True when ``wallet`` matches the property's ``owner_wallet`` (case-insensitive)."""
+    owner = normalize_address(property_item.get("owner_wallet") or "")
+    viewer = normalize_address(wallet or "")
+    return bool(owner and viewer and owner == viewer)
+
+
+def apply_property_visibility(property_item: dict, viewer: Optional["AuthUser"]) -> dict:
+    """Attach ``can_manage`` and scrub ``owner_wallet`` for non-owning property owners.
+
+    The admin UI infers edit/delete from ``owner_wallet === session wallet``. Hiding
+    another owner's wallet in list/detail responses prevents cross-tenant controls
+    without a frontend change. Investors/tenants still receive the real owner address.
+    """
+    if not property_item:
+        return property_item
+
+    owner = normalize_address(property_item.get("owner_wallet") or "")
+    viewer_wallet = normalize_address(viewer.wallet_address) if viewer else ""
+    is_owner = property_is_owned_by(property_item, viewer_wallet) if viewer_wallet else False
+    role = (viewer.role or "").lower() if viewer else ""
+    can_manage = bool(viewer and role == "property_owner" and is_owner)
+    property_item["can_manage"] = can_manage
+
+    if viewer and role == "property_owner" and owner and not is_owner:
+        property_item["owner_wallet"] = None
+
+    return property_item
+
+
+def enrich_property_with_supply(
+    cursor,
+    property_item: dict,
+    *,
+    viewer: Optional["AuthUser"] = None,
+) -> dict:
     if not property_item:
         return property_item
 
@@ -141,6 +181,12 @@ def enrich_property_with_supply(cursor, property_item: dict) -> dict:
         rent_wei = 0
     property_item["monthly_rent_wei"] = str(rent_wei)
     property_item["monthly_rent_eth"] = str(from_wei(rent_wei)) if rent_wei else "0"
+
+    if viewer is not None:
+        apply_property_visibility(property_item, viewer)
+    else:
+        property_item.setdefault("can_manage", False)
+
     return property_item
 
 

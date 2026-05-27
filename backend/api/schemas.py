@@ -62,6 +62,7 @@ class PropertyRead(BaseModel):
     tokens_sold: Decimal = Decimal("0")
     tokens_available: Decimal = Decimal("0")
     sold_percentage: Decimal = Decimal("0")
+    can_manage: bool = False
 
 
 class MintNFTRequest(BaseModel):
