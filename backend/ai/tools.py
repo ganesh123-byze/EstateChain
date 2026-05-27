@@ -63,6 +63,107 @@ def _current_history() -> list[Any]:
     return _current_messages.get() or []
 
 
+_current_thread_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "ai_tool_thread_id", default=None
+)
+
+# Per-thread workflow state survives across HTTP/voice turns. The client only
+# sends user/assistant text (no ToolMessages), and LangGraph checkpoints may
+# not retain tool results when the messages channel is rebuilt each request.
+_workflow_sessions: dict[str, dict[str, Any]] = {}
+
+
+def set_current_thread_id(thread_id: str | None) -> contextvars.Token:
+    return _current_thread_id.set(thread_id)
+
+
+def reset_current_thread_id(token: contextvars.Token) -> None:
+    _current_thread_id.reset(token)
+
+
+def _workflow_session_key(modal: str) -> str | None:
+    tid = _current_thread_id.get()
+    if not tid:
+        return None
+    return f"{tid}:{modal}"
+
+
+def _get_workflow_session(modal: str) -> dict[str, Any]:
+    key = _workflow_session_key(modal)
+    if not key:
+        return {}
+    return dict(_workflow_sessions.get(key) or {})
+
+
+def _set_workflow_session(modal: str, data: dict[str, Any]) -> None:
+    key = _workflow_session_key(modal)
+    if key:
+        _workflow_sessions[key] = data
+
+
+def _clear_workflow_session(modal: str) -> None:
+    key = _workflow_session_key(modal)
+    if key:
+        _workflow_sessions.pop(key, None)
+
+
+def _message_role(msg: Any) -> str:
+    if isinstance(msg, dict):
+        return (msg.get("type") or msg.get("role") or "").lower()
+    cls = type(msg).__name__.lower()
+    if "human" in cls:
+        return "human"
+    if "ai" in cls or "assistant" in cls:
+        return "assistant"
+    if "tool" in cls:
+        return "tool"
+    return ""
+
+
+def _message_content(msg: Any) -> str:
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, dict):
+        content = msg.get("content")
+    return (content or "").strip() if isinstance(content, str) else ""
+
+
+def _merge_last_user_utterance(
+    accumulated: dict[str, str],
+    modal: str,
+    fields: tuple[str, ...],
+    required: tuple[str, ...],
+) -> dict[str, str]:
+    """If the LLM omitted the field the user just answered, use the last human line."""
+    session = _get_workflow_session(modal)
+    next_field = session.get("next_field")
+    missing = [f for f in required if f not in accumulated or not accumulated.get(f)]
+    if not next_field and missing:
+        next_field = missing[0]
+    if not next_field or next_field not in fields or accumulated.get(next_field):
+        return accumulated
+
+    hist = _current_history() or []
+    last_human_idx: int | None = None
+    last_ai_idx: int | None = None
+    for i, msg in enumerate(hist):
+        role = _message_role(msg)
+        if role in ("human", "user"):
+            last_human_idx = i
+        elif role in ("ai", "assistant"):
+            last_ai_idx = i
+    # Only use a user line that came after the latest assistant message (the
+    # field question). Otherwise we'd treat "create a property" as the name.
+    if last_human_idx is None:
+        return accumulated
+    if last_ai_idx is not None and last_human_idx <= last_ai_idx:
+        return accumulated
+
+    text = _message_content(hist[last_human_idx])
+    if text:
+        accumulated[next_field] = text
+    return accumulated
+
+
 # ---------------------------------------------------------------------------
 # Tool metadata + dispatch
 # ---------------------------------------------------------------------------
@@ -1416,13 +1517,44 @@ _CREATE_PROPERTY_FIELDS = (
 
 
 async def _start_create_property(_args: dict, _user: AuthUser, _db: Any) -> ToolResult:
+    modal = "CREATE_PROPERTY"
+    required = _CREATE_PROPERTY_FIELDS[:5]
+    session = _get_workflow_session(modal)
+    # True restart only after a completed submit or when nothing was collected yet.
+    if session.get("submitted") or not session.get("filled"):
+        _clear_workflow_session(modal)
+        session = {}
+    filled = dict(session.get("filled") or {})
+    missing = [f for f in required if f not in filled or not filled.get(f)]
+    next_field = missing[0] if missing else None
+    _set_workflow_session(
+        modal,
+        {
+            "in_progress": True,
+            "filled": filled,
+            "next_field": next_field or "name",
+            "submitted": False,
+        },
+    )
+    focus_field = next_field or "name"
     return ToolResult(
         ok=True,
-        data={"message": "Opening the create property form."},
+        data={
+            "message": "Opening the create property form.",
+            "filled": filled,
+            "missing": missing,
+            "next_field": next_field or "name",
+            "instruction": (
+                f"Form already has: {', '.join(f'{k}={v}' for k, v in filled.items())}. "
+                f"Ask about {next_field or 'name'} only — do NOT re-ask for fields in filled."
+                if filled
+                else "Ask: What's the name of the property?"
+            ),
+        },
         actions=[
             AgentAction(type="NAVIGATE", route="/property_owner/properties"),
             AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
-            AgentAction(type="FOCUS_FIELD", modal="CREATE_PROPERTY", field="name"),
+            AgentAction(type="FOCUS_FIELD", modal="CREATE_PROPERTY", field=focus_field),
         ],
     )
 
@@ -1475,17 +1607,21 @@ def _recover_form_state(modal: str, tool_name: str, fields: tuple[str, ...]) -> 
     start_tool = tool_name.replace("fill_", "start_", 1)
 
     accumulated: dict[str, str] = {}
+    session = _get_workflow_session(modal)
+    session_filled = session.get("filled") or {}
+    if isinstance(session_filled, dict):
+        for k, v in session_filled.items():
+            if k in fields and v not in (None, ""):
+                accumulated[k] = str(v)
+
     for msg in _current_history() or []:
         name = getattr(msg, "name", None) or (msg.get("name") if isinstance(msg, dict) else None)
         content = getattr(msg, "content", None)
         if content is None and isinstance(msg, dict):
             content = msg.get("content")
 
-        # Restart boundary — every time the LLM re-opens the dialog we
-        # are starting a fresh workflow, regardless of whether the prior
-        # one was submitted. Drop everything we'd accumulated so far.
+        # start_* is handled via the session store (client history has no tools).
         if name == start_tool:
-            accumulated = {}
             continue
 
         if name != tool_name or not content:
@@ -1539,6 +1675,8 @@ def _build_fill_workflow(
             continue
         accumulated[field] = str(value)
 
+    accumulated = _merge_last_user_utterance(accumulated, modal, fields, required)
+
     for field, value in accumulated.items():
         actions.append(AgentAction(
             type="FILL_FIELD",
@@ -1550,8 +1688,26 @@ def _build_fill_workflow(
     missing = [f for f in required if f not in accumulated or accumulated.get(f) in (None, "")]
 
     submit = bool(args.get("submit"))
+    next_field = missing[0] if missing else None
+    instruction: str | None = None
+    if accumulated and next_field:
+        instruction = (
+            "Already collected: "
+            + ", ".join(f"{k}={v!r}" for k, v in accumulated.items())
+            + f". Ask the user for {next_field} next. "
+            "Do NOT re-ask for any field already in filled."
+        )
+    elif not missing:
+        instruction = (
+            "All required fields are collected. Call this tool again with submit=true."
+        )
+
     if submit and not missing:
         actions.append(AgentAction(type="SUBMIT_FORM", modal=modal))
+        _set_workflow_session(
+            modal,
+            {"in_progress": False, "filled": accumulated, "next_field": None, "submitted": True},
+        )
         return ToolResult(
             ok=True,
             data={
@@ -1559,11 +1715,11 @@ def _build_fill_workflow(
                 "missing": [],
                 "submitted": True,
                 "next_field": None,
+                "instruction": instruction,
             },
             actions=actions,
         )
 
-    next_field = missing[0] if missing else None
     if submit and missing:
         # The LLM asked to submit but we don't have everything — keep filling
         # what we have, surface what's missing, and tell the LLM what to ask
@@ -1580,10 +1736,20 @@ def _build_fill_workflow(
                 "missing": missing,
                 "submitted": False,
                 "next_field": next_field,
+                "instruction": instruction,
             },
             actions=actions,
         )
 
+    _set_workflow_session(
+        modal,
+        {
+            "in_progress": True,
+            "filled": accumulated,
+            "next_field": next_field,
+            "submitted": False,
+        },
+    )
     return ToolResult(
         ok=True,
         data={
@@ -1591,6 +1757,7 @@ def _build_fill_workflow(
             "missing": missing,
             "submitted": False,
             "next_field": next_field,
+            "instruction": instruction,
         },
         actions=actions,
     )
@@ -1667,6 +1834,7 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
                 data.get("property_id"),
                 success_message,
             )
+            _clear_workflow_session("CREATE_PROPERTY")
             return ToolResult(ok=True, data=data, actions=actions)
         except HTTPException as exc:
             detail = exc.detail

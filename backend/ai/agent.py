@@ -27,7 +27,14 @@ from langgraph.graph.state import CompiledStateGraph
 from backend.ai.config import get_settings
 from backend.ai.prompts import system_prompt_for_role
 from backend.ai.schemas import AgentAction, ChatMessage, ChatResponse, InterruptResponse
-from backend.ai.tools import dispatch, openai_tool_schemas, reset_current_messages, set_current_messages
+from backend.ai.tools import (
+    dispatch,
+    openai_tool_schemas,
+    reset_current_messages,
+    reset_current_thread_id,
+    set_current_messages,
+    set_current_thread_id,
+)
 from backend.services.auth import AuthUser, canonical_role
 
 LOGGER = logging.getLogger(__name__)
@@ -179,6 +186,8 @@ async def _call_tools(state: AgentState, user: AuthUser, db: Any) -> dict:
                     result_data["filled_fields"] = result.data["filled"]
                 if result.data and "missing" in result.data:
                     result_data["missing_required"] = result.data["missing"]
+                if result.data and result.data.get("instruction"):
+                    result_data["instruction"] = result.data["instruction"]
                 if result.data and result.data.get("success_message"):
                     result_data["success_message"] = result.data["success_message"]
                     result_data["speak_to_user"] = result.data.get(
@@ -360,7 +369,12 @@ async def run_agent(
     if thread_id:
         config["configurable"] = {"thread_id": thread_id}
 
-    final_state = await graph.ainvoke(AgentState(messages=messages, actions=[]), config=config or None)
+    effective_thread = thread_id or f"user:{user.wallet_address or user.id}"
+    tid_token = set_current_thread_id(effective_thread)
+    try:
+        final_state = await graph.ainvoke(AgentState(messages=messages, actions=[]), config=config or None)
+    finally:
+        reset_current_thread_id(tid_token)
 
     final_msg = final_state["messages"][-1]
     reply = (final_msg.content or "").strip()
@@ -490,46 +504,54 @@ async def stream_agent(
     if thread_id:
         config["configurable"] = {"thread_id": thread_id}
 
-    async for event in graph.astream_events(
-        AgentState(messages=messages, actions=[]),
-        config=config or None,
-        version="v2",
-    ):
-        kind = event.get("event")
-        if kind == "on_chat_model_stream":
-            chunk = event.get("data", {}).get("chunk")
-            if chunk and chunk.content:
-                yield {"type": "token", "content": chunk.content}
-        elif kind == "on_tool_start":
-            yield {
-                "type": "tool_start",
-                "name": event.get("name", ""),
-                "input": event.get("data", {}).get("input"),
-            }
-        elif kind == "on_tool_end":
-            yield {
-                "type": "tool_end",
-                "name": event.get("name", ""),
-                "output": event.get("data", {}).get("output"),
-            }
-        elif kind == "on_chain_end" and event.get("name") == "LangGraph":
-            final_state = event.get("data", {}).get("output", {})
-            final_msg = final_state.get("messages", [None])[-1]
-            reply = (final_msg.content or "").strip() if final_msg else ""
-            interrupt = final_state.get("interrupt")
-            actions = final_state.get("actions", [])
-            LOGGER.info("[stream_agent] Final reply length: %d, actions count: %d", len(reply), len(actions))
-            if not reply:
-                LOGGER.warning("[stream_agent] Final reply is empty - this may indicate the model didn't generate a response after tool execution")
-            LOGGER.info("[stream_agent] Final actions count: %d, actions: %s", len(actions), actions)
-            payload: dict[str, Any] = {
-                "type": "complete",
-                "reply": reply,
-                "actions": [a.model_dump() for a in actions],
-            }
-            if interrupt:
-                payload["interrupt"] = {
-                    "message": interrupt.get("message", ""),
-                    "pending_actions": [a.model_dump() for a in interrupt.get("pending_actions", [])],
+    effective_thread = thread_id or f"user:{user.wallet_address or user.id}"
+    tid_token = set_current_thread_id(effective_thread)
+    try:
+        async for event in graph.astream_events(
+            AgentState(messages=messages, actions=[]),
+            config=config or None,
+            version="v2",
+        ):
+            kind = event.get("event")
+            if kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk and chunk.content:
+                    yield {"type": "token", "content": chunk.content}
+            elif kind == "on_tool_start":
+                yield {
+                    "type": "tool_start",
+                    "name": event.get("name", ""),
+                    "input": event.get("data", {}).get("input"),
                 }
-            yield payload
+            elif kind == "on_tool_end":
+                yield {
+                    "type": "tool_end",
+                    "name": event.get("name", ""),
+                    "output": event.get("data", {}).get("output"),
+                }
+            elif kind == "on_chain_end" and event.get("name") == "LangGraph":
+                final_state = event.get("data", {}).get("output", {})
+                final_msg = final_state.get("messages", [None])[-1]
+                reply = (final_msg.content or "").strip() if final_msg else ""
+                interrupt = final_state.get("interrupt")
+                actions = final_state.get("actions", [])
+                LOGGER.info("[stream_agent] Final reply length: %d, actions count: %d", len(reply), len(actions))
+                if not reply:
+                    LOGGER.warning(
+                        "[stream_agent] Final reply is empty - this may indicate the model "
+                        "didn't generate a response after tool execution"
+                    )
+                LOGGER.info("[stream_agent] Final actions count: %d, actions: %s", len(actions), actions)
+                payload: dict[str, Any] = {
+                    "type": "complete",
+                    "reply": reply,
+                    "actions": [a.model_dump() for a in actions],
+                }
+                if interrupt:
+                    payload["interrupt"] = {
+                        "message": interrupt.get("message", ""),
+                        "pending_actions": [a.model_dump() for a in interrupt.get("pending_actions", [])],
+                    }
+                yield payload
+    finally:
+        reset_current_thread_id(tid_token)

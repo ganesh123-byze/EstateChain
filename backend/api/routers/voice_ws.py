@@ -10,6 +10,11 @@ Flow per turn:
      so playback can begin immediately with minimal latency.
   4. Frontend can send {"type": "interrupt"} for barge-in, which cancels the
      in-flight LLM + TTS streams.
+
+Rapid back-to-back utterances are serialized (one turn at a time). A new intent
+cancels the in-flight turn, always emits ``interrupted`` or ``complete`` so the
+client leaves the "thinking" state, and the LangGraph stream is closed on cancel
+so the worker cannot hang.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ import asyncio
 import base64
 import json
 import logging
-from typing import AsyncGenerator
+from typing import AsyncIterator
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
@@ -33,10 +38,13 @@ LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ai/voice", tags=["ai-voice"])
 
-
 # ElevenLabs WS endpoint streams audio as base64 chunks in PCM at the requested rate.
 _TTS_SAMPLE_RATE = 16000
 _TTS_OUTPUT_FORMAT = f"pcm_{_TTS_SAMPLE_RATE}"
+
+# Hard limits so a stuck LLM/TTS turn cannot wedge the voice worker forever.
+_VOICE_TURN_TIMEOUT_SEC = 120.0
+_CANCEL_JOIN_TIMEOUT_SEC = 12.0
 
 
 async def _elevenlabs_tts_stream(
@@ -109,6 +117,8 @@ async def _elevenlabs_tts_stream(
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=0.2)
                     except asyncio.TimeoutError:
+                        if cancel.is_set():
+                            break
                         continue
                     try:
                         data = json.loads(raw)
@@ -167,6 +177,26 @@ def _authenticate(token: str | None) -> AuthUser:
                 pass
 
 
+async def _stream_agent_events(
+    user: AuthUser,
+    history: list[ChatMessage],
+    db,
+    *,
+    thread_id: str,
+    checkpointer,
+    cancel: asyncio.Event,
+) -> AsyncIterator[dict]:
+    """Wrap ``stream_agent`` so cancel closes the async generator (no orphan LLM work)."""
+    agen = stream_agent(user, history, db, thread_id=thread_id, checkpointer=checkpointer)
+    try:
+        async for event in agen:
+            if cancel.is_set():
+                break
+            yield event
+    finally:
+        await agen.aclose()
+
+
 @router.websocket("/stream")
 async def voice_duplex_stream(websocket: WebSocket, token: str | None = Query(default=None)):
     """Persistent duplex voice channel for the chat UI."""
@@ -179,16 +209,27 @@ async def voice_duplex_stream(websocket: WebSocket, token: str | None = Query(de
     cur_cancel: asyncio.Event | None = None
     cur_text_q: asyncio.Queue | None = None
     cur_tasks: list[asyncio.Task] = []
+    cur_assistant_replied: bool = False
+
+    # Serialize voice turns — rapid back-to-back utterances are queued so we
+    # never start a second turn before the first has fully torn down.
+    intent_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    intent_worker: asyncio.Task | None = None
+    turn_lock = asyncio.Lock()
+    turn_active = False
 
     # Server-side conversation history. The HTTP /chat path receives the full
     # transcript from the client every turn, but the voice WS only receives the
-    # latest user utterance, so we must remember prior turns here. Without
-    # this, the agent forgets what it already asked and re-asks the same
-    # question after each answer (e.g. during the create-property workflow).
+    # latest user utterance, so we must remember prior turns here.
     history: list[ChatMessage] = []
 
-    async def _cancel_current():
-        nonlocal cur_cancel, cur_text_q, cur_tasks
+    def _rollback_incomplete_user_turn() -> None:
+        """Drop the last user line if this turn never produced an assistant reply."""
+        if history and history[-1].role == "user":
+            history.pop()
+
+    async def _cancel_current(*, rollback_user: bool = True) -> None:
+        nonlocal cur_cancel, cur_text_q, cur_tasks, cur_assistant_replied
         if cur_cancel:
             cur_cancel.set()
         if cur_text_q is not None:
@@ -199,41 +240,61 @@ async def voice_duplex_stream(websocket: WebSocket, token: str | None = Query(de
         for t in cur_tasks:
             if not t.done():
                 t.cancel()
-        for t in cur_tasks:
+        if cur_tasks:
             try:
-                await t
-            except Exception:
-                pass
+                await asyncio.wait_for(
+                    asyncio.gather(*cur_tasks, return_exceptions=True),
+                    timeout=_CANCEL_JOIN_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning("Voice turn task cancel timed out after %.0fs", _CANCEL_JOIN_TIMEOUT_SEC)
+        if rollback_user and not cur_assistant_replied:
+            _rollback_incomplete_user_turn()
         cur_cancel = None
         cur_text_q = None
         cur_tasks = []
+        cur_assistant_replied = False
 
-    async def _run_turn(user_text: str):
-        nonlocal cur_cancel, cur_text_q, cur_tasks
-        await _cancel_current()
+    async def _safe_send(payload: dict) -> None:
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            pass
+
+    async def _finish_turn_client_state(*, turn_completed: bool, partial_reply: str = "") -> None:
+        """Ensure the UI leaves 'thinking' even when a turn was cancelled mid-flight."""
+        if not turn_completed:
+            if partial_reply.strip():
+                await _safe_send({
+                    "type": "complete",
+                    "reply": partial_reply.strip(),
+                    "actions": [],
+                })
+            else:
+                await _safe_send({"type": "interrupted"})
+
+    async def _execute_turn(user_text: str) -> tuple[bool, str]:
+        """Run one voice turn. Returns (complete_sent, partial_reply_text)."""
+        nonlocal cur_cancel, cur_text_q, cur_tasks, cur_assistant_replied, turn_active
+
+        await _cancel_current(rollback_user=False)
         cancel = asyncio.Event()
         text_q: asyncio.Queue = asyncio.Queue()
         audio_q: asyncio.Queue = asyncio.Queue()
         cur_cancel = cancel
         cur_text_q = text_q
+        cur_assistant_replied = False
+        turn_completed = False
+        partial_reply = ""
 
         voice_id = get_settings().elevenlabs_voice_id
-
-        # Append the new user message to the running transcript BEFORE we
-        # start streaming so the agent sees full context.
         history.append(ChatMessage(role="user", content=user_text))
 
         async def llm_pump():
+            nonlocal cur_assistant_replied, turn_completed, partial_reply
             checkpointer = await get_saver()
             full_text = ""
-            # SmartChunkBuffer batches tokens into 25..60 char phrase chunks at
-            # punctuation boundaries before flushing to ElevenLabs. Token-level
-            # feeding produces fragmented prosody; phrase-level feeding sounds
-            # natural while still streaming as the LLM generates.
             chunker = SmartChunkBuffer(min_chars=25, max_chars=60)
-            # Each turn gets its own DB connection. Read-only tools share it,
-            # write tools (delete_property) commit through it. We close in
-            # finally so a long-lived voice session never leaks connections.
             db = None
             try:
                 db = get_connection()
@@ -241,82 +302,85 @@ async def voice_duplex_stream(websocket: WebSocket, token: str | None = Query(de
                 LOGGER.warning("Voice turn: DB connect failed (read-only mode): %s", exc)
                 db = None
             try:
-                async for event in stream_agent(
+                async for event in _stream_agent_events(
                     user,
                     history,
                     db,
                     thread_id=thread_id,
                     checkpointer=checkpointer,
+                    cancel=cancel,
                 ):
-                    if cancel.is_set():
-                        break
                     if event.get("type") == "token":
                         delta = event.get("content") or ""
                         if delta:
                             full_text += delta
-                            await websocket.send_json({"type": "token", "text": delta})
+                            partial_reply = full_text
+                            await _safe_send({"type": "token", "text": delta})
                             for chunk in chunker.feed(delta):
-                                # Trailing space helps ElevenLabs pace between
-                                # phrases and keeps token boundaries clean.
                                 await text_q.put(chunk + " ")
                     elif event.get("type") == "tool_start":
-                        await websocket.send_json({
+                        await _safe_send({
                             "type": "tool_start",
                             "name": event.get("name", ""),
                         })
                     elif event.get("type") == "complete":
                         actions = event.get("actions") or []
                         reply = event.get("reply") or full_text
+                        partial_reply = reply or full_text
                         tail = chunker.flush()
                         if tail:
                             await text_q.put(tail + " ")
                         elif not full_text and reply:
                             await text_q.put(reply)
-                        # Remember the assistant reply so the next user turn
-                        # has the full context (this is what fixes the
-                        # "AI re-asks the same question" loop).
                         if reply:
                             history.append(ChatMessage(role="assistant", content=reply))
-                        await websocket.send_json({
+                            cur_assistant_replied = True
+                        await _safe_send({
                             "type": "complete",
                             "reply": reply,
                             "actions": actions,
                         })
+                        turn_completed = True
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("LLM pump failed: %s", exc)
-                try:
-                    await websocket.send_json({"type": "error", "detail": str(exc)[:200]})
-                except Exception:
-                    pass
+                await _safe_send({"type": "error", "detail": str(exc)[:200]})
             finally:
                 if db is not None:
                     try:
                         db.close()
                     except Exception:
                         pass
-                # Make sure anything still buffered when an exception fires also flushes.
                 tail = chunker.flush()
-                if tail:
+                if tail and not cancel.is_set():
                     try:
                         await text_q.put(tail + " ")
                     except Exception:
                         pass
-                await text_q.put(None)
+                try:
+                    await text_q.put(None)
+                except Exception:
+                    pass
 
         async def tts_pump():
             await _elevenlabs_tts_stream(text_q, audio_q, cancel, voice_id)
 
         async def audio_pump():
             while True:
-                chunk = await audio_q.get()
-                if chunk is None:
+                if cancel.is_set():
                     try:
-                        await websocket.send_json({"type": "audio_end"})
-                    except Exception:
+                        while True:
+                            chunk = audio_q.get_nowait()
+                            if chunk is None:
+                                return
+                    except asyncio.QueueEmpty:
                         pass
                     return
-                if cancel.is_set():
-                    continue
+                chunk = await audio_q.get()
+                if chunk is None:
+                    await _safe_send({"type": "audio_end"})
+                    return
                 try:
                     await websocket.send_json({
                         "type": "audio",
@@ -332,8 +396,62 @@ async def voice_duplex_stream(websocket: WebSocket, token: str | None = Query(de
             asyncio.create_task(audio_pump()),
         ]
 
+        try:
+            await asyncio.gather(*cur_tasks, return_exceptions=True)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Voice turn gather failed: %s", exc)
+
+        return turn_completed, partial_reply
+
+    async def _intent_worker() -> None:
+        """Process one voice intent at a time; always reset client state after each turn."""
+        nonlocal turn_active
+        while True:
+            user_text = await intent_queue.get()
+            if user_text is None:
+                return
+            turn_completed = False
+            partial_reply = ""
+            async with turn_lock:
+                turn_active = True
+                try:
+                    turn_completed, partial_reply = await asyncio.wait_for(
+                        _execute_turn(user_text),
+                        timeout=_VOICE_TURN_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    LOGGER.warning("Voice turn timed out after %.0fs", _VOICE_TURN_TIMEOUT_SEC)
+                    await _cancel_current()
+                    await _safe_send({
+                        "type": "error",
+                        "detail": "Voice response timed out. Please try again.",
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.exception("Voice intent worker failed: %s", exc)
+                    await _cancel_current()
+                    await _safe_send({"type": "error", "detail": str(exc)[:200]})
+                finally:
+                    turn_active = False
+                    await _finish_turn_client_state(
+                        turn_completed=turn_completed,
+                        partial_reply=partial_reply,
+                    )
+
+    async def _enqueue_intent(text: str) -> None:
+        """Cancel any in-flight turn, coalesce backlog to the latest utterance, queue it."""
+        async with turn_lock:
+            if turn_active or cur_tasks:
+                await _cancel_current()
+            while not intent_queue.empty():
+                try:
+                    intent_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            await intent_queue.put(text)
+
     try:
         await websocket.send_json({"type": "ready", "sample_rate": _TTS_SAMPLE_RATE})
+        intent_worker = asyncio.create_task(_intent_worker())
         while True:
             raw = await websocket.receive_text()
             try:
@@ -344,13 +462,16 @@ async def voice_duplex_stream(websocket: WebSocket, token: str | None = Query(de
             if kind == "intent":
                 text = (msg.get("text") or "").strip()
                 if text:
-                    await _run_turn(text)
+                    await _enqueue_intent(text)
             elif kind == "interrupt":
-                await _cancel_current()
-                try:
-                    await websocket.send_json({"type": "interrupted"})
-                except Exception:
-                    pass
+                async with turn_lock:
+                    await _cancel_current()
+                    while not intent_queue.empty():
+                        try:
+                            intent_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                await _safe_send({"type": "interrupted"})
             elif kind == "ping":
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
@@ -358,7 +479,16 @@ async def voice_duplex_stream(websocket: WebSocket, token: str | None = Query(de
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Voice WS error: %s", exc)
     finally:
-        await _cancel_current()
+        if intent_worker is not None:
+            try:
+                await intent_queue.put(None)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(intent_worker, timeout=5.0)
+            except Exception:
+                intent_worker.cancel()
+        await _cancel_current(rollback_user=False)
         try:
             await websocket.close()
         except Exception:
