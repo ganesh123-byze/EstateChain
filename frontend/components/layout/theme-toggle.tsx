@@ -11,30 +11,39 @@ export function ThemeToggle({ className }: { className?: string }) {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
+  /* defaultTheme is dark — align knob before hydration to avoid a light flash */
   const isDark = mounted ? resolvedTheme === "dark" : true;
+  const isTall = className?.includes("h-9");
+  const knobClass = isTall ? "h-7 w-7" : "h-5 w-5";
 
   return (
     <button
       type="button"
       role="switch"
-      aria-checked={isDark}
-      aria-label="Toggle theme"
+      aria-checked={mounted ? isDark : false}
+      aria-label={isDark ? "Switch to light theme" : "Switch to dark theme"}
       onClick={() => setTheme(isDark ? "light" : "dark")}
       className={cn(
-        "relative inline-flex h-7 w-12 items-center rounded-full border border-border bg-muted/60 transition-colors hover:bg-muted",
+        "relative inline-flex shrink-0 items-center rounded-full border border-border bg-muted/60 p-0.5 transition-colors hover:bg-muted",
+        isTall ? "h-9 w-[3.25rem]" : "h-7 w-12",
+        isDark ? "justify-end" : "justify-start",
         className,
       )}
     >
-      <Sun className="absolute left-1.5 h-3.5 w-3.5 text-warning" />
-      <Moon className="absolute right-1.5 h-3.5 w-3.5 text-foreground/80" />
       <motion.span
         layout
         transition={{ type: "spring", stiffness: 500, damping: 30 }}
         className={cn(
-          "z-10 inline-block h-5 w-5 rounded-full bg-background shadow-md ring-1 ring-border",
-          isDark ? "translate-x-[26px]" : "translate-x-[2px]",
+          "relative z-10 grid place-items-center rounded-full bg-background shadow-md ring-1 ring-border",
+          knobClass,
         )}
-      />
+      >
+        {!mounted || isDark ? (
+          <Sun className="h-3.5 w-3.5 text-amber-500" aria-hidden />
+        ) : (
+          <Moon className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
+        )}
+      </motion.span>
     </button>
   );
 }

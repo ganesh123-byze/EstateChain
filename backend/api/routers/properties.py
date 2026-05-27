@@ -18,6 +18,7 @@ from backend.api._helpers import (
     find_existing_property,
     get_total_minted_base,
     lock_property,
+    property_needs_token_deployment,
     require_property_token,
     sync_investors_to_contract,
     sync_rent_amount_to_contract,
@@ -191,6 +192,12 @@ def create_property(
             cursor, payload, token_price_wei, monthly_rent_wei, owner_wallet
         )
         if existing_property:
+            if property_needs_token_deployment(existing_property):
+                property_id = int(existing_property["id"])
+                db.commit()
+                _finalize_new_property(db, property_id)
+                cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
+                return enrich_property_with_supply(cursor, cursor.fetchone())
             return enrich_property_with_supply(cursor, existing_property)
 
         cursor.execute(
@@ -264,9 +271,13 @@ async def create_property_stream(
                 cursor, payload, token_price_wei, monthly_rent_wei, owner_wallet
             )
             if existing:
-                final = enrich_property_with_supply(cursor, existing)
-                yield _sse({"step": "done", "duplicate": True, "property": _json_safe_property(final)})
-                return
+                if property_needs_token_deployment(existing):
+                    property_id = int(existing["id"])
+                    yield _sse({"step": "created", "property_id": property_id, "resuming_setup": True})
+                else:
+                    final = enrich_property_with_supply(cursor, existing)
+                    yield _sse({"step": "done", "duplicate": True, "property": _json_safe_property(final)})
+                    return
 
             yield _sse({"step": "creating"})
             cursor.execute(
@@ -295,11 +306,33 @@ async def create_property_stream(
         # calls are blocking. We yield the *intent* event before kicking
         # off the thread so the UI advances right away, and the *done*
         # event after — which lets the client mark the row as completed.
-        async def run_stage(intent: str, completed: str, work: Callable[[], None]):
+        def _rent_sync_skippable(exc: HTTPException) -> str | None:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                if detail.get("code") == "DEPLOYER_CONTRACT_MISMATCH":
+                    return str(detail.get("message") or detail)
+                return None
+            text = str(detail)
+            if "DEPLOYER_CONTRACT_MISMATCH" in text or "not the owner" in text or "Ownable" in text:
+                return text
+            return None
+
+        async def run_stage(
+            intent: str,
+            completed: str,
+            work: Callable[[], None],
+            *,
+            allow_rent_sync_skip: bool = False,
+        ):
             yield _sse({"step": intent})
             try:
                 await asyncio.to_thread(work)
             except HTTPException as exc:
+                skip_msg = _rent_sync_skippable(exc) if allow_rent_sync_skip else None
+                if skip_msg:
+                    LOGGER.warning("create_property_stream stage %s skipped: %s", intent, skip_msg)
+                    yield _sse({"step": "rent_sync_skipped", "detail": skip_msg})
+                    return
                 LOGGER.warning("create_property_stream stage %s failed: %s", intent, exc.detail)
                 yield _sse({"step": "error", "detail": str(exc.detail)})
                 raise
@@ -316,8 +349,12 @@ async def create_property_stream(
             async for ev in run_stage("finalizing_inventory", "inventory_done",
                                       lambda: _finalize_step_finalize_inventory(db, property_id)):
                 yield ev
-            async for ev in run_stage("syncing_rent", "rent_synced",
-                                      lambda: _finalize_step_sync_rent(db, property_id)):
+            async for ev in run_stage(
+                "syncing_rent",
+                "rent_synced",
+                lambda: _finalize_step_sync_rent(db, property_id),
+                allow_rent_sync_skip=True,
+            ):
                 yield ev
         except Exception:
             return  # error event was already yielded inside run_stage

@@ -13,6 +13,7 @@
  */
 
 import { apiPostMultipart, getApiBase, getToken } from "@/lib/api";
+import { RUNTIME_CONFIG } from "@/lib/runtime-config";
 
 const SILENCE_RMS = 0.012;
 const SILENCE_HOLD_MS = 1400;
@@ -219,33 +220,131 @@ export function stopSpeaking() {
   setSpeaking(false);
 }
 
-/** Fetch ElevenLabs MP3 for the text, then play. Awaits playback finish. */
-export async function speak(text: string): Promise<void> {
-  const clean = (text || "").trim();
-  if (!clean || typeof window === "undefined") return;
+function pickBrowserVoice(): SpeechSynthesisVoice | null {
+  const synth = window.speechSynthesis;
+  if (!synth) return null;
+  const voices = synth.getVoices();
+  if (!voices.length) return null;
+  const wantFemale = RUNTIME_CONFIG.workflowTtsGender === "female";
+  const hint = wantFemale
+    ? /female|samantha|victoria|zira|aria|jenny|sonia/i
+    : /male|daniel|david|mark|guy|ryan|andrew/i;
+  return (
+    voices.find((v) => hint.test(v.name) && v.lang.toLowerCase().startsWith("en")) ??
+    voices.find((v) => v.lang.toLowerCase().startsWith("en")) ??
+    voices[0] ??
+    null
+  );
+}
 
-  stopSpeaking();
-  const abort = new AbortController();
-  _ttsAbort = abort;
+async function waitForBrowserVoices(synth: SpeechSynthesis): Promise<void> {
+  if (synth.getVoices().length > 0) return;
+  await new Promise<void>((resolve) => {
+    const done = () => resolve();
+    synth.addEventListener("voiceschanged", done, { once: true });
+    window.setTimeout(done, 300);
+  });
+}
 
+async function speakWithBrowser(text: string, signal: AbortSignal): Promise<void> {
+  const synth = window.speechSynthesis;
+  if (!synth) throw new Error("Speech synthesis is not available in this browser.");
+
+  await waitForBrowserVoices(synth);
+
+  return new Promise<void>((resolve, reject) => {
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = RUNTIME_CONFIG.workflowTtsRate;
+    const voice = pickBrowserVoice();
+    if (voice) utterance.voice = voice;
+
+    const onAbort = () => {
+      synth.cancel();
+      setSpeaking(false);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    utterance.onend = () => {
+      signal.removeEventListener("abort", onAbort);
+      setSpeaking(false);
+      resolve();
+    };
+    utterance.onerror = () => {
+      signal.removeEventListener("abort", onAbort);
+      setSpeaking(false);
+      reject(new Error("Browser speech synthesis failed."));
+    };
+
+    setSpeaking(true);
+    synth.cancel();
+    synth.speak(utterance);
+  });
+}
+
+async function playMp3Blob(blob: Blob, signal: AbortSignal): Promise<void> {
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  _audio = audio;
+  setSpeaking(true);
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      URL.revokeObjectURL(url);
+      if (_audio === audio) {
+        _audio = null;
+        setSpeaking(false);
+      }
+    };
+    const finish = () => {
+      cleanup();
+      resolve();
+    };
+    const fail = () => {
+      cleanup();
+      reject(new Error("Audio playback failed."));
+    };
+    if (signal.aborted) {
+      cleanup();
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    signal.addEventListener(
+      "abort",
+      () => {
+        try {
+          audio.pause();
+        } catch {
+          /* ignore */
+        }
+        cleanup();
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+    audio.onended = finish;
+    audio.onerror = fail;
+    void audio.play().catch(fail);
+  });
+}
+
+/** Fetch ElevenLabs MP3 from the backend, then play. Falls back to browser TTS. */
+async function speakWithElevenLabs(text: string, signal: AbortSignal): Promise<void> {
   const base = getApiBase();
   const token = getToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
 
-  let response: Response;
-  try {
-    response = await fetch(`${base}/api/ai/voice/speak`, {
-      method: "POST",
-      signal: abort.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: token ? `Bearer ${token}` : "",
-      },
-      body: JSON.stringify({ text: clean }),
-    });
-  } catch (err) {
-    if ((err as Error).name === "AbortError") return;
-    throw err;
-  }
+  const response = await fetch(`${base}/api/ai/voice/speak`, {
+    method: "POST",
+    signal,
+    headers,
+    body: JSON.stringify({ text }),
+  });
 
   if (!response.ok) {
     let detail = `TTS failed (${response.status})`;
@@ -259,26 +358,38 @@ export async function speak(text: string): Promise<void> {
   }
 
   const blob = await response.blob();
-  if (abort.signal.aborted) return;
+  if (signal.aborted) return;
+  await playMp3Blob(blob, signal);
+}
 
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  _audio = audio;
-  setSpeaking(true);
+/**
+ * Read assistant text aloud (ElevenLabs via backend, browser voice as fallback).
+ * No-op when workflow TTS is disabled via NEXT_PUBLIC_WORKFLOW_TTS_ENABLED=false.
+ */
+export async function speak(text: string): Promise<void> {
+  const clean = (text || "").trim();
+  if (!clean || typeof window === "undefined" || !RUNTIME_CONFIG.workflowTtsEnabled) return;
 
-  await new Promise<void>((resolve) => {
-    const cleanup = () => {
-      URL.revokeObjectURL(url);
-      if (_audio === audio) {
-        _audio = null;
-        setSpeaking(false);
-      }
-      resolve();
-    };
-    audio.onended = cleanup;
-    audio.onerror = cleanup;
-    audio.play().catch(cleanup);
-  });
+  stopSpeaking();
+  const abort = new AbortController();
+  _ttsAbort = abort;
+
+  try {
+    await speakWithElevenLabs(clean, abort.signal);
+  } catch (err) {
+    if ((err as Error).name === "AbortError") return;
+    stopSpeaking();
+    const browserAbort = new AbortController();
+    _ttsAbort = browserAbort;
+    try {
+      await speakWithBrowser(clean, browserAbort.signal);
+    } catch (fallbackErr) {
+      if ((fallbackErr as Error).name === "AbortError") return;
+      throw fallbackErr;
+    }
+  } finally {
+    if (_ttsAbort === abort) _ttsAbort = null;
+  }
 }
 
 /** Call once on a user gesture to unlock audio autoplay on iOS/Safari. */

@@ -62,6 +62,19 @@
     --glass-highlight: 0 0% 100% / 0.6;
   }
 
+  /* Investor suite — Figma light text (primary #010101, secondary #6c7381) */
+  html:not(.dark).investor-route {
+    --background: 228 33% 97%;
+    --foreground: 0 0% 0.4%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 0.4%;
+    --popover-foreground: 0 0% 0.4%;
+    --secondary-foreground: 0 0% 0.4%;
+    --muted-foreground: 221 9% 46%;
+    --border: 220 20% 92%;
+    --chart-7: 221 9% 46%;
+  }
+
   .dark {
     --background: 224 38% 8%;
     --foreground: 220 20% 97%;

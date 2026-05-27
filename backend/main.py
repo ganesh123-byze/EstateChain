@@ -26,6 +26,16 @@ async def lifespan(app: FastAPI):
     validate_required_settings()
     init_db()
     try:
+        from backend.services.blockchain import platform_deployer_mismatch
+
+        mismatch = platform_deployer_mismatch()
+        if mismatch:
+            logging.getLogger(__name__).warning(
+                "Platform deployer mismatch: %s", mismatch.get("message")
+            )
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).debug("Deployer mismatch check skipped: %s", exc)
+    try:
         await setup_checkpointer()
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning("LangGraph checkpointer init failed (optional): %s", exc)

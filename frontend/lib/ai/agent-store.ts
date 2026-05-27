@@ -1,13 +1,15 @@
 "use client";
 
 import { create } from "zustand";
-import { getApiBase } from "@/lib/api";
+import { getApiBase, getToken } from "@/lib/api";
+import { RUNTIME_CONFIG } from "@/lib/runtime-config";
 import { executeActions, subscribeCompletion, type AICompletionEvent } from "./action-executor";
 import {
   cancelRecording,
   onSpeakingChange,
   speak,
   stopSpeaking,
+  unlockAudio,
 } from "./voice";
 import type { AIAction, AIMessage, AIState } from "./types";
 import { VoiceSessionManager } from "./conversation";
@@ -123,16 +125,6 @@ export type AgentStore = {
 const WELCOME =
   "Hi! I'm EstateChain Copilot. Ask about your properties, investments, or rent — or tap the voice icon for a live conversation.";
 
-function _authToken(): string {
-  try {
-    const raw = localStorage.getItem("estatechain.session.v1");
-    if (!raw) return "";
-    return JSON.parse(raw).token || "";
-  } catch {
-    return "";
-  }
-}
-
 function appendOrUpdateAssistant(messages: AIMessage[], delta: string): AIMessage[] {
   if (messages.length === 0 || messages[messages.length - 1].role !== "assistant") {
     return [...messages, msg("assistant", delta)];
@@ -174,7 +166,6 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   async send(text, router, opts) {
     const clean = text.trim();
     if (!clean) return;
-    const fromVoice = opts?.fromVoice ?? false;
 
     stopSpeaking();
 
@@ -192,14 +183,14 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
 
     try {
       const base = getApiBase();
-      const token = _authToken();
+      const token = getToken() || "";
+
+      const streamHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) streamHeaders.Authorization = `Bearer ${token}`;
 
       const fetchRes = await fetch(`${base}/api/ai/chat/stream`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: token ? `Bearer ${token}` : "",
-        },
+        headers: streamHeaders,
         body: JSON.stringify({
           messages: history.map((m) => ({ role: m.role, content: m.content })),
         }),
@@ -280,13 +271,16 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
         }
       }
 
-      const spokenText = finalReply || streamingText;
-      if (fromVoice && spokenText) {
+      // Text chat: read replies aloud (voice duplex uses WS PCM + fallback in conversation.ts).
+      const spokenText = (finalReply || streamingText).trim();
+      const shouldSpeak =
+        RUNTIME_CONFIG.workflowTtsEnabled && !get().voiceMode && spokenText.length > 0;
+      if (shouldSpeak) {
         set({ state: "speaking" });
         try {
           await speak(spokenText);
         } catch {
-          /* TTS failure is non-fatal */
+          /* TTS failure is non-fatal — chat text remains visible */
         }
       }
     } catch (err: any) {
@@ -322,6 +316,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     if (shouldGreet) {
       welcomeText = welcomeFor(role);
       _markGreetedRole(role);
+      unlockAudio();
       welcomePromise = speak(welcomeText).catch(() => {
         /* TTS failures are non-fatal — the chat already shows the welcome */
       });

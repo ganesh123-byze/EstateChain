@@ -1,10 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
-import { ArrowUpRight, Building2, Coins, LineChart, Receipt, Wallet } from "lucide-react";
-import { Area, AreaChart, ResponsiveContainer, Tooltip } from "recharts";
-import { AdminTopbar } from "@/components/layout/topbar";
+import { useMemo, useState } from "react";
+import { ArrowUpRight, Building2, LineChart } from "lucide-react";
+import { InvestorTopbar } from "@/components/investor/investor-topbar";
+import { InvestorKpiCard } from "@/components/investor/investor-kpi-card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,15 +12,20 @@ import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   useClaimableRewards,
-  useInvestorPayouts,
   useInvestorTransactions,
   useInvestorYieldSummary,
   usePortfolio,
   useProperties,
   useWalletBalances,
 } from "@/lib/queries";
-import { cn, formatCurrency, formatDateTime, formatEth, formatNumber, formatShortDate, parseBackendDate, shortAddress } from "@/lib/utils";
+import { cn, formatDateTime, formatEth, formatNumber } from "@/lib/utils";
 import { txExplorerUrl } from "@/lib/runtime-config";
+import {
+  InvestorClaimDialog,
+  useInvestorClaimRewardsListener,
+} from "@/components/investor/investor-claim-dialog";
+import { InvestorEarningsAndClaimSections } from "@/components/investor/investor-earnings-claim-sections";
+import type { ClaimableRewardProperty } from "@/lib/types";
 import { buildInvestorMetrics, humanTokenAmount, ownershipPercent } from "@/components/investor/investor-utils";
 import { useCurrentWallet } from "@/components/investor/use-current-wallet";
 
@@ -31,7 +36,6 @@ export default function InvestorDashboardPage() {
   const balances = useWalletBalances(wallet);
   const yieldSummary = useInvestorYieldSummary(wallet);
   const claimable = useClaimableRewards(wallet);
-  const payouts = useInvestorPayouts(wallet);
   const transactions = useInvestorTransactions(wallet);
 
   const propertyMap = useMemo(
@@ -42,35 +46,35 @@ export default function InvestorDashboardPage() {
     () => buildInvestorMetrics(portfolio.data?.holdings ?? [], properties.data ?? []),
     [portfolio.data?.holdings, properties.data],
   );
-  const timeline = useMemo(
-    () =>
-      (payouts.data ?? [])
-        .slice()
-        .sort((a, b) => (parseBackendDate(a.distributed_at)?.getTime() ?? 0) - (parseBackendDate(b.distributed_at)?.getTime() ?? 0))
-        .slice(-10)
-        .map((p) => ({
-          name: formatShortDate(p.distributed_at),
-          value: Number(p.payout_amount_eth ?? 0),
-        })),
-    [payouts.data],
-  );
-
   const loading = properties.isLoading || portfolio.isLoading;
   const holdings = portfolio.data?.holdings ?? [];
-  const nextClaim = claimable.data?.properties?.[0];
+  const claimableProperties = claimable.data?.properties ?? [];
+  const nextClaim = claimableProperties[0];
+  const [selectedClaim, setSelectedClaim] = useState<ClaimableRewardProperty | null>(null);
+  useInvestorClaimRewardsListener(claimableProperties, setSelectedClaim);
 
   return (
     <>
-      <AdminTopbar
+      <InvestorTopbar
         title="Investor Dashboard"
         subtitle="Your holdings, yield, wallet health, and latest on-chain activity"
       />
       <main className="flex-1 space-y-4 p-4 lg:p-6">
-        <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-          <MetricCard title="Portfolio Value" value={formatCurrency(metrics.estimatedValue)} icon={Wallet} loading={loading} sub={`${metrics.propertiesOwned} properties`} />
-          <MetricCard title="Tokens Held" value={formatNumber(metrics.totalTokens, 4)} icon={Building2} loading={loading} sub={`${holdings.length} active positions`} />
-          <MetricCard title="Claimable Yield" value={`${claimable.data?.total_claimable_eth ?? "0"} ETH`} icon={Coins} loading={claimable.isLoading} sub={`${claimable.data?.properties?.length ?? 0} properties accruing`} accent="success" />
-          <MetricCard title="Wallet Balance" value={formatEth(balances.data?.native?.balance ?? "0", { digits: 4 })} icon={LineChart} loading={balances.isLoading} sub={shortAddress(wallet, 6, 4)} />
+        <section className="grid grid-cols-2 gap-1.5">
+          <InvestorKpiCard
+            title="Tokens Held"
+            value={formatNumber(metrics.totalTokens, 4)}
+            icon={Building2}
+            variant="violet"
+            loading={loading}
+          />
+          <InvestorKpiCard
+            title="Wallet Balance"
+            value={formatEth(balances.data?.native?.balance ?? "0", { digits: 4 })}
+            icon={LineChart}
+            variant="mint"
+            loading={balances.isLoading}
+          />
         </section>
 
         <section className="grid grid-cols-1 gap-4 xl:grid-cols-[1.35fr_0.65fr]">
@@ -130,7 +134,9 @@ export default function InvestorDashboardPage() {
             <CardContent className="space-y-4">
               <div>
                 <div className="text-3xl font-semibold tracking-tight">{claimable.data?.total_claimable_eth ?? "0"} ETH</div>
-                <div className="mt-1 text-xs text-muted-foreground">Total claimed: {claimable.data?.total_claimed_eth ?? yieldSummary.data?.total_claimed_eth ?? "0"} ETH</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  Total claimed: {claimable.data?.total_claimed_eth ?? yieldSummary.data?.total_claimed_eth ?? "0"} ETH
+                </div>
               </div>
               {nextClaim ? (
                 <div className="rounded-lg border border-border bg-card p-3">
@@ -143,47 +149,24 @@ export default function InvestorDashboardPage() {
                   </div>
                 </div>
               ) : (
-                <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">No claimable rewards yet.</div>
+                <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
+                  No claimable rewards yet.
+                </div>
               )}
-              <Button asChild className="w-full">
-                <Link href="/investor/yield">Review Yield & Claims</Link>
+              <Button
+                className="w-full"
+                disabled={!nextClaim}
+                onClick={() => nextClaim && setSelectedClaim(nextClaim)}
+              >
+                Claim rewards
               </Button>
             </CardContent>
           </Card>
         </section>
 
-        <section className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>Yield Timeline</CardTitle>
-              <CardDescription>Recent rental accruals credited to your wallet.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {payouts.isLoading ? (
-                <Skeleton className="h-[210px] w-full" />
-              ) : timeline.length === 0 ? (
-                <div className="grid h-[210px] place-items-center text-sm text-muted-foreground">No rental accruals yet.</div>
-              ) : (
-                <ResponsiveContainer width="100%" height={210}>
-                  <AreaChart data={timeline} margin={{ top: 12, right: 8, left: -18, bottom: 0 }}>
-                    <defs>
-                      <linearGradient id="investorYield" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="hsl(var(--primary))" stopOpacity={0.35} />
-                        <stop offset="100%" stopColor="hsl(var(--primary))" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <Tooltip
-                      contentStyle={{ background: "hsl(var(--popover))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }}
-                      formatter={(value: number) => [`${Number(value).toFixed(6)} ETH`, "Accrued"]}
-                    />
-                    <Area dataKey="value" type="monotone" stroke="hsl(var(--primary))" fill="url(#investorYield)" strokeWidth={2} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              )}
-            </CardContent>
-          </Card>
+        <InvestorEarningsAndClaimSections />
 
-          <Card>
+        <Card>
             <CardHeader className="flex flex-row items-start justify-between gap-4">
               <div>
                 <CardTitle>Recent Activity</CardTitle>
@@ -210,40 +193,10 @@ export default function InvestorDashboardPage() {
                 ))
               )}
             </CardContent>
-          </Card>
-        </section>
+        </Card>
       </main>
+      <InvestorClaimDialog wallet={wallet} reward={selectedClaim} onClose={() => setSelectedClaim(null)} />
     </>
   );
 }
 
-function MetricCard({
-  title,
-  value,
-  sub,
-  icon: Icon,
-  loading,
-  accent,
-}: {
-  title: string;
-  value: string;
-  sub?: string;
-  icon: React.ComponentType<{ className?: string }>;
-  loading?: boolean;
-  accent?: "success";
-}) {
-  return (
-    <Card>
-      <CardContent className="flex items-start justify-between gap-3 p-4">
-        <div className="min-w-0">
-          <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{title}</div>
-          {loading ? <Skeleton className="mt-2 h-7 w-24" /> : <div className="mt-1 truncate text-xl font-semibold tabular-nums">{value}</div>}
-          {sub && !loading ? <div className="mt-0.5 truncate text-[11px] text-muted-foreground">{sub}</div> : null}
-        </div>
-        <div className={cn("grid h-9 w-9 shrink-0 place-items-center rounded-md bg-primary/10 text-primary", accent === "success" && "bg-success/10 text-success")}>
-          <Icon className="h-4 w-4" />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}

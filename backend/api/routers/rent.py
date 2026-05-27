@@ -399,6 +399,19 @@ def prepare_rent_payment(
                     detail=f"Rent already paid for this period. Next due {due_label}.",
                 )
 
+        from backend.services.blockchain import platform_deployer_mismatch
+
+        mismatch = platform_deployer_mismatch()
+        if mismatch:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{mismatch.get('message')} "
+                    "Tenant rent cannot be prepared until platform contracts are redeployed "
+                    "with the wallet in DEPLOYER_PRIVATE_KEY."
+                ),
+            )
+
         try:
             synced_count = _ensure_rent_chain_ready_for_payment(cursor, property_item, property_id)
             if synced_count:
@@ -407,14 +420,35 @@ def prepare_rent_payment(
                     synced_count,
                     property_id,
                 )
-        except HTTPException:
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict) and detail.get("code") == "DEPLOYER_CONTRACT_MISMATCH":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{detail.get('message')} "
+                        "Ask the property owner to run platform deploy (`npm run deploy:sepolia`) "
+                        "and Sync Rent Chain on this property."
+                    ),
+                ) from exc
             raise
         except Exception as sync_exc:
+            err = str(sync_exc)
             LOGGER.warning(
                 "prepare_rent_payment stage=sync_failed property_id=%s error=%s",
                 property_id,
                 sync_exc,
             )
+            if "not the owner" in err or "Ownable" in err:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Rent contract sync failed: the backend deployer wallet is not the owner "
+                        "of RentDistribution on Sepolia. The property owner must redeploy platform "
+                        "contracts with the correct DEPLOYER_PRIVATE_KEY, then open the property "
+                        "and use Sync Rent Chain before tenants can pay."
+                    ),
+                ) from sync_exc
             raise HTTPException(
                 status_code=409,
                 detail=(

@@ -9,6 +9,7 @@ const nextConfig = {
     return [
       { source: "/admin", destination: "/property_owner", permanent: true },
       { source: "/admin/:path*", destination: "/property_owner/:path*", permanent: true },
+      { source: "/investor/yield", destination: "/investor", permanent: false },
     ];
   },
 };

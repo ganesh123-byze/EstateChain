@@ -4,6 +4,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Ensure ROOT .env is loaded before first get_settings() — same file as backend.config.settings.
+_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_ROOT / ".env")
 
 
 def _env(name: str, default: str = "") -> str:

@@ -16,21 +16,83 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_GAS = 5_000_000
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
-_web3 = Web3(Web3.HTTPProvider(SEPOLIA_RPC_URL or WEB3_PROVIDER_URI))
+_web3: Web3 | None = None
+_web3_uri: str | None = None
+
+
+def _provider_uri() -> str:
+    return (SEPOLIA_RPC_URL or WEB3_PROVIDER_URI or "").strip()
 
 
 def get_web3() -> Web3:
+    global _web3, _web3_uri
+    uri = _provider_uri()
+    if not uri:
+        raise RuntimeError("SEPOLIA_RPC_URL or WEB3_PROVIDER_URI is not set")
+    if _web3 is None or _web3_uri != uri:
+        _web3_uri = uri
+        _web3 = Web3(Web3.HTTPProvider(uri))
     return _web3
+
+
+def rpc_is_healthy() -> bool:
+    """True when Sepolia RPC responds; more reliable than Web3.is_connected() alone."""
+    try:
+        web3 = get_web3()
+        if web3.is_connected():
+            return True
+        web3.eth.block_number  # noqa: B018 — probe RPC
+        return True
+    except Exception:
+        return False
 
 
 def get_deployer_account():
     if not DEPLOYER_PRIVATE_KEY:
-        raise RuntimeError("DEPLOYER_PRIVATE_KEY is not set")
+        raise RuntimeError(
+            "DEPLOYER_PRIVATE_KEY is not set in .env. "
+            "Add the Sepolia private key for the platform deployer wallet "
+            "(must own PropertyNFT / RentDistribution and hold Sepolia ETH for gas)."
+        )
     return _web3.eth.account.from_key(DEPLOYER_PRIVATE_KEY)
 
 
 def get_deployer_address() -> str:
     return get_deployer_account().address
+
+
+def platform_deployer_mismatch() -> dict | None:
+    """Return mismatch metadata when DEPLOYER_PRIVATE_KEY is not the on-file platform owner."""
+    if not DEPLOYER_PRIVATE_KEY:
+        return {
+            "code": "MISSING_DEPLOYER_KEY",
+            "message": (
+                "DEPLOYER_PRIVATE_KEY is not set. Token deployment and rent registration require "
+                "the wallet that owns PropertyNFT and RentDistribution on Sepolia."
+            ),
+        }
+    try:
+        current = get_deployer_address()
+    except Exception:
+        return None
+    from backend.config.settings import load_contract_addresses
+
+    recorded = str(load_contract_addresses().get("Deployer") or "").strip()
+    if not recorded:
+        return None
+    if current.lower() == recorded.lower():
+        return None
+    return {
+        "code": "DEPLOYER_CONTRACT_MISMATCH",
+        "current_deployer": current,
+        "contract_owner": recorded,
+        "message": (
+            f"DEPLOYER_PRIVATE_KEY wallet ({current}) does not match the owner recorded in "
+            f"contract-addresses.json ({recorded}). Rent sync and shared-contract admin calls "
+            f"will revert. Run `npm run deploy:sepolia` with the intended wallet, update "
+            f"INDEXER_START_BLOCK to the new DeployBlock, and restart the API."
+        ),
+    }
 
 
 def to_base_units(amount: Decimal | str | int, decimals: int) -> int:

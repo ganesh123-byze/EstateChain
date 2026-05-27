@@ -39,3 +39,9 @@ export function txExplorerUrl(hash?: string | null): string {
   if (!hash) return "#";
   return `${RUNTIME_CONFIG.explorerTxBase}${hash}`;
 }
+
+export function addressExplorerUrl(address?: string | null): string {
+  if (!address) return "#";
+  const base = RUNTIME_CONFIG.explorerTxBase.replace(/\/tx\/?$/i, "/address/");
+  return `${base}${address}`;
+}

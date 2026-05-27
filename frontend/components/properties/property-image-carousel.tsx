@@ -13,6 +13,8 @@ type PropertyImageCarouselProps = {
   title: string;
   className?: string;
   children?: React.ReactNode;
+  /** Clean hero for listing cards — no title overlay, centered dots */
+  variant?: "default" | "listing";
 };
 
 export function PropertyImageCarousel({
@@ -21,27 +23,31 @@ export function PropertyImageCarousel({
   title,
   className,
   children,
+  variant = "default",
 }: PropertyImageCarouselProps) {
+  const isListing = variant === "listing";
   const safeImages = (images ?? []).filter(Boolean);
+  // Listing cards show one cover image only; detail dialogs use PropertyImageGallery.
+  const displayImages = isListing ? safeImages.slice(0, 1) : safeImages;
   const [index, setIndex] = useState(0);
   const [paused, setPaused] = useState(false);
-  const current = safeImages[index] ?? null;
-  const hasMultiple = safeImages.length > 1;
+  const current = displayImages[index] ?? null;
+  const hasMultiple = !isListing && displayImages.length > 1;
 
   useEffect(() => {
     setIndex(0);
-  }, [propertyId, safeImages.length]);
+  }, [propertyId, displayImages.length]);
 
   useEffect(() => {
     if (!hasMultiple || paused) return;
     const timer = window.setInterval(() => {
-      setIndex((value) => (value + 1) % safeImages.length);
+      setIndex((value) => (value + 1) % displayImages.length);
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [hasMultiple, paused, safeImages.length]);
+  }, [hasMultiple, paused, displayImages.length]);
 
   function go(delta: number) {
-    setIndex((value) => (value + delta + safeImages.length) % safeImages.length);
+    setIndex((value) => (value + delta + displayImages.length) % displayImages.length);
   }
 
   return (
@@ -63,7 +69,11 @@ export function PropertyImageCarousel({
           className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.02]"
         />
       ) : null}
-      <div className="absolute inset-0 bg-gradient-to-t from-card via-card/45 to-transparent" />
+      {!isListing ? (
+        <div className="absolute inset-0 bg-gradient-to-t from-card via-card/45 to-transparent" />
+      ) : (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/25 to-transparent" />
+      )}
 
       {hasMultiple ? (
         <>
@@ -71,7 +81,10 @@ export function PropertyImageCarousel({
             type="button"
             variant="secondary"
             size="icon"
-            className="absolute left-2 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full bg-background/80"
+            className={cn(
+              "absolute left-2 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full bg-background/80",
+              isListing && "opacity-0 transition-opacity group-hover:opacity-100",
+            )}
             onClick={(event) => {
               event.stopPropagation();
               go(-1);
@@ -83,7 +96,10 @@ export function PropertyImageCarousel({
             type="button"
             variant="secondary"
             size="icon"
-            className="absolute right-2 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full bg-background/80"
+            className={cn(
+              "absolute right-2 top-1/2 h-7 w-7 -translate-y-1/2 rounded-full bg-background/80",
+              isListing && "opacity-0 transition-opacity group-hover:opacity-100",
+            )}
             onClick={(event) => {
               event.stopPropagation();
               go(1);
@@ -91,12 +107,17 @@ export function PropertyImageCarousel({
           >
             <ChevronRight className="h-3.5 w-3.5" />
           </Button>
-          <div className="absolute bottom-2 right-3 flex gap-1">
-            {safeImages.map((_, dotIndex) => (
+          <div
+            className={cn(
+              "absolute bottom-3 flex gap-1",
+              isListing ? "left-1/2 -translate-x-1/2" : "right-3",
+            )}
+          >
+            {displayImages.map((_, dotIndex) => (
               <span
                 key={dotIndex}
                 className={cn(
-                  "h-1.5 rounded-full bg-white/60 transition-all",
+                  "h-1.5 rounded-full bg-white/70 shadow-sm transition-all",
                   dotIndex === index ? "w-4 bg-white" : "w-1.5",
                 )}
               />

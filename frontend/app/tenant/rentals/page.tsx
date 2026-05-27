@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArrowUpRight, Building2, CheckCircle2, CreditCard, MapPin, Receipt, Search, ShieldCheck, Wallet, X } from "lucide-react";
+import { CheckCircle2, CreditCard, Receipt, Search, ShieldCheck, Wallet } from "lucide-react";
 import { api } from "@/lib/api";
 import { queryKeys, useTenantActiveRentals, useTenantProperties } from "@/lib/queries";
 import { AdminTopbar } from "@/components/layout/topbar";
@@ -19,11 +19,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/common/empty";
-import { cn, formatCurrency, formatDateTime, formatNumber, percent, shortAddress } from "@/lib/utils";
-import { PropertyImageCarousel } from "@/components/properties/property-image-carousel";
+import { cn, formatDateTime, shortAddress } from "@/lib/utils";
+import { PropertyDetailDialog } from "@/components/properties/property-detail-dialog";
+import { PropertyListingCard } from "@/components/properties/property-listing-card";
 import type { PayRentPrepareResponse, Property } from "@/lib/types";
 import { useCurrentWallet } from "@/components/investor/use-current-wallet";
 import { sendPayRentTx } from "@/components/investor/contract-actions";
@@ -67,7 +67,7 @@ export default function TenantRentalsPage() {
 
         {properties.isLoading ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-            {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-[380px] rounded-xl" />)}
+            {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-[420px] rounded-xl" />)}
           </div>
         ) : filtered.length === 0 ? (
           <EmptyState title="No properties found" description="Try a different search term or wait for new listings." />
@@ -106,69 +106,53 @@ function RentalCard({
   const supply = Number(property.token_supply ?? 0);
   const soldPct = Number(property.sold_percentage ?? percent(sold, supply));
   const monthlyRent = Number(property.monthly_rent_eth ?? 0);
-  const [open, setOpen] = useState(false);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [payOpen, setPayOpen] = useState(false);
 
   useEffect(() => {
     if (takePendingModalOpen("PAY_RENT", property.id)) {
-      setOpen(true);
+      setDetailOpen(true);
+      setPayOpen(true);
     }
     return subscribeWorkflowAction((action) => {
       if (!isWorkflowModalAction(action, "PAY_RENT")) return;
       if (action.type === "OPEN_MODAL" && workflowPropertyMatches(action, property.id)) {
-        setOpen(true);
+        setDetailOpen(true);
+        setPayOpen(true);
       }
     });
   }, [property.id]);
 
   return (
-    <Card className="group overflow-hidden transition-transform duration-200 hover:-translate-y-0.5">
-      <PropertyImageCarousel images={property.images} propertyId={property.id} title={property.name}>
-        <div className="absolute left-3 top-3 flex gap-2">
-          <Badge variant={property.rent_enabled ? "success" : "warning"}>{property.rent_enabled ? "Rent ready" : "Rent not set"}</Badge>
-          {isActiveRental && <Badge variant="outline" className="rounded-md">Currently Renting</Badge>}
-        </div>
-        <div className="absolute bottom-3 left-3 right-3">
-          <h3 className="truncate text-lg font-semibold tracking-tight">{property.name}</h3>
-          <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"><MapPin className="h-3 w-3" /> {property.location}</div>
-        </div>
-      </PropertyImageCarousel>
-      <CardContent className="space-y-4 p-4">
-        <div className="grid grid-cols-2 gap-3 text-xs">
-          <Fact label="Monthly rent" value={monthlyRent > 0 ? `${monthlyRent.toFixed(4)} ETH` : "Not set"} />
-          <Fact label="Property value" value={formatCurrency(property.total_value)} />
-          <Fact label="Token symbol" value={property.token_symbol} />
-          <Fact label="Ownership sold" value={`${soldPct.toFixed(1)}%`} />
-        </div>
-        <div>
-          <div className="mb-1.5 flex items-center justify-between text-xs">
-            <span className="text-muted-foreground">Token sale progress</span>
-            <span className="font-medium tabular-nums">{formatNumber(sold)} / {formatNumber(supply)}</span>
-          </div>
-          <Progress value={soldPct} className="h-1.5" />
-        </div>
-        <div className="flex items-center justify-between gap-3 border-t border-border pt-3">
-          <div className="min-w-0 text-[11px] text-muted-foreground font-mono">{shortAddress(property.token_address, 6, 4)}</div>
-          <Button
-            size="sm"
-            variant={property.current_cycle_paid ? "secondary" : "default"}
-            disabled={!wallet || !property.rent_enabled || property.current_cycle_paid}
-            onClick={() => setOpen(true)}
-          >
-            {property.current_cycle_paid ? (
-              <>
-                <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
-                Paid ✔
-              </>
-            ) : (
-              <>
-                <Receipt className="mr-1 h-3.5 w-3.5" />
-                Pay Rent
-              </>
-            )}
-          </Button>
-        </div>
-        {property.current_cycle_paid ? (
-          <div className="rounded-md border border-success/25 bg-success/5 px-3 py-2 text-xs font-medium text-success">
+  <>
+    <PropertyListingCard
+      property={property}
+      onClick={() => setDetailOpen(true)}
+      statusLabel={
+        property.rent_enabled
+          ? isActiveRental
+            ? "Renting"
+            : "Rent ready"
+          : "Rent not set"
+      }
+      statusVariant={property.rent_enabled ? "success" : "warning"}
+      actionLabel={property.current_cycle_paid ? "Paid" : "Rent now"}
+      actionIcon={
+        property.current_cycle_paid ? (
+          <CheckCircle2 className="h-3.5 w-3.5" />
+        ) : (
+          <Receipt className="h-3.5 w-3.5" />
+        )
+      }
+      actionVariant={property.current_cycle_paid ? "secondary" : "default"}
+      actionDisabled={!wallet || !property.rent_enabled || property.current_cycle_paid}
+      onActionClick={() => {
+        setDetailOpen(false);
+        setPayOpen(true);
+      }}
+      footerExtra={
+        property.current_cycle_paid ? (
+          <div className="mt-3 rounded-md border border-success/25 bg-success/5 px-3 py-2 text-xs font-medium text-success">
             Rent paid for this period.
             {property.next_rent_due_at ? (
               <span className="mt-0.5 block font-normal text-success/90">
@@ -176,10 +160,22 @@ function RentalCard({
               </span>
             ) : null}
           </div>
-        ) : null}
-      </CardContent>
-      <PayRentDialog property={property} wallet={wallet} open={open} onOpenChange={setOpen} />
-    </Card>
+        ) : null
+      }
+    />
+
+    <PropertyDetailDialog
+      property={property}
+      open={detailOpen}
+      onOpenChange={setDetailOpen}
+      role="tenant"
+      wallet={wallet}
+      isActiveRental={isActiveRental}
+      onPrimaryAction={() => setPayOpen(true)}
+      primaryDisabled={!wallet || !property.rent_enabled || property.current_cycle_paid}
+    />
+    <PayRentDialog property={property} wallet={wallet} open={payOpen} onOpenChange={setPayOpen} />
+  </>
   );
 }
 

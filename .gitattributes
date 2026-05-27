@@ -1,0 +1,14 @@
+# Normalize line endings for cross-platform clones (Windows / macOS / Linux)
+* text=auto eol=lf
+
+*.{cmd,bat} text eol=crlf
+*.{ps1,psm1} text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary

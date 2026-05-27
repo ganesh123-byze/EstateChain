@@ -69,6 +69,15 @@ export function useProperties() {
   });
 }
 
+export function useProperty(propertyId?: number | null) {
+  return useQuery({
+    queryKey: queryKeys.property(propertyId ?? 0),
+    queryFn: () => api.get<Property>(`/properties/${propertyId}`),
+    enabled: !!propertyId,
+    refetchInterval: POLL_MS,
+  });
+}
+
 export function useTransactions() {
   return useQuery({
     queryKey: queryKeys.transactions,

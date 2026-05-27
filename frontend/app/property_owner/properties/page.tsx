@@ -52,7 +52,7 @@ export default function PropertiesPage() {
         {properties.isLoading && filtered.length === 0 ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
             {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-[320px] w-full rounded-xl" />
+              <Skeleton key={i} className="h-[420px] w-full rounded-xl" />
             ))}
           </div>
         ) : filtered.length === 0 ? (

@@ -1,18 +1,19 @@
 "use client";
 
 import { useMemo } from "react";
-import { Building2, Coins, PieChart, Wallet } from "lucide-react";
+import { Building2, Coins, History, Wallet } from "lucide-react";
 import { Cell, Pie, PieChart as RePieChart, ResponsiveContainer, Tooltip } from "recharts";
 import { motion } from "framer-motion";
-import { AdminTopbar } from "@/components/layout/topbar";
+import { InvestorTopbar } from "@/components/investor/investor-topbar";
+import { InvestorKpiCard } from "@/components/investor/investor-kpi-card";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/common/empty";
 import { InvestmentSimulationWorkbench } from "@/components/investor/investment-simulation-workbench";
-import { usePortfolio, useProperties, useWalletBalances } from "@/lib/queries";
-import { cn, formatCurrency, formatEth, formatNumber, shortAddress } from "@/lib/utils";
+import { useInvestorYieldSummary, usePortfolio, useProperties, useWalletBalances } from "@/lib/queries";
+import { cn, formatCurrency, shortAddress } from "@/lib/utils";
 import { pickColor } from "@/lib/charts";
 import { buildInvestorMetrics, holdingValue, humanTokenAmount, ownershipPercent } from "@/components/investor/investor-utils";
 import { useCurrentWallet } from "@/components/investor/use-current-wallet";
@@ -21,6 +22,7 @@ export default function InvestorPortfolioPage() {
   const wallet = useCurrentWallet();
   const properties = useProperties();
   const portfolio = usePortfolio(wallet);
+  const yieldSummary = useInvestorYieldSummary(wallet);
   const balances = useWalletBalances(wallet);
   const holdings = portfolio.data?.holdings ?? [];
   const propertyMap = useMemo(() => new Map((properties.data ?? []).map((p) => [Number(p.id), p])), [properties.data]);
@@ -41,13 +43,37 @@ export default function InvestorPortfolioPage() {
 
   return (
     <>
-      <AdminTopbar title="Portfolio" subtitle="Token holdings, ownership percentages, and wallet balances" />
+      <InvestorTopbar title="Portfolio" subtitle="Token holdings, ownership percentages, and wallet balances" />
       <main className="flex-1 space-y-4 p-4 lg:p-6">
-        <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-          <Stat title="Estimated Value" value={formatCurrency(metrics.estimatedValue)} icon={Wallet} loading={properties.isLoading || portfolio.isLoading} />
-          <Stat title="Tokens Held" value={formatNumber(metrics.totalTokens, 4)} icon={Coins} loading={portfolio.isLoading} />
-          <Stat title="Properties Owned" value={String(metrics.propertiesOwned)} icon={Building2} loading={portfolio.isLoading} />
-          <Stat title="ETH Balance" value={formatEth(balances.data?.native.balance ?? "0", { digits: 4 })} icon={PieChart} loading={balances.isLoading} />
+        <section className="grid grid-cols-2 gap-1.5 sm:grid-cols-2 xl:grid-cols-4">
+          <InvestorKpiCard
+            title="Estimated Value"
+            value={formatCurrency(metrics.estimatedValue)}
+            icon={Wallet}
+            variant="violet"
+            loading={properties.isLoading || portfolio.isLoading}
+          />
+          <InvestorKpiCard
+            title="Properties Owned"
+            value={String(metrics.propertiesOwned)}
+            icon={Building2}
+            variant="mint"
+            loading={portfolio.isLoading}
+          />
+          <InvestorKpiCard
+            title="Total Earned"
+            value={`${yieldSummary.data?.total_earned_eth ?? "0"} ETH`}
+            icon={Coins}
+            variant="sky"
+            loading={yieldSummary.isLoading}
+          />
+          <InvestorKpiCard
+            title="Payout Records"
+            value={String(yieldSummary.data?.total_payouts ?? 0)}
+            icon={History}
+            variant="periwinkle"
+            loading={yieldSummary.isLoading}
+          />
         </section>
 
         <section className="grid grid-cols-1 gap-4 xl:grid-cols-[0.72fr_1.28fr]">
@@ -167,12 +193,6 @@ export default function InvestorPortfolioPage() {
         </Card>
       </main>
     </>
-  );
-}
-
-function Stat({ title, value, icon: Icon, loading }: { title: string; value: string; icon: React.ComponentType<{ className?: string }>; loading?: boolean }) {
-  return (
-    <Card><CardContent className="flex items-start justify-between gap-3 p-4"><div><div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{title}</div>{loading ? <Skeleton className="mt-2 h-7 w-24" /> : <div className="mt-1 text-xl font-semibold tabular-nums">{value}</div>}</div><div className="grid h-9 w-9 place-items-center rounded-md bg-primary/10 text-primary"><Icon className="h-4 w-4" /></div></CardContent></Card>
   );
 }
 

@@ -35,6 +35,8 @@
  *   - Stricter Silero acceptance while aiPlaying (avgConfidence ≥ 0.92 gate)
  */
 import { getApiBase, apiPostMultipart, getToken } from "@/lib/api";
+import { RUNTIME_CONFIG } from "@/lib/runtime-config";
+import { speak } from "./voice";
 import { SileroVad, floatToWavBlob, type SpeechSegment } from "./silero-vad";
 
 type SessionState =
@@ -86,6 +88,8 @@ export class VoiceSessionManager {
 
   // STT in-flight tracking
   private sttInFlight = 0;
+  /** True when the current WS turn delivered playable PCM (ElevenLabs stream). */
+  private turnHadStreamedAudio = false;
 
   // State
   private state: SessionState = "idle";
@@ -203,6 +207,7 @@ export class VoiceSessionManager {
   sendIntent(text: string) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.stopPlayback();
+    this.turnHadStreamedAudio = false;
     this.setState("thinking");
     this.ws.send(JSON.stringify({ type: "intent", text }));
   }
@@ -242,12 +247,30 @@ export class VoiceSessionManager {
           // Flush any remaining prebuffer if the backend finished before we hit 300 ms.
           this.flushPrebufferEarly();
           break;
-        case "complete":
+        case "complete": {
           if (data.actions && this.callbacks.onActions) {
             this.callbacks.onActions(data.actions);
           }
-          if (!this.aiPlaying && !this.sttInFlight) this.setState("listening");
+          const reply = String(data.reply || "").trim();
+          if (
+            RUNTIME_CONFIG.workflowTtsEnabled &&
+            reply &&
+            !this.turnHadStreamedAudio &&
+            !this.aiPlaying
+          ) {
+            void speak(reply)
+              .catch(() => {
+                /* non-fatal */
+              })
+              .finally(() => {
+                if (!this.stopped && !this.sttInFlight) this.setState("listening");
+              });
+          } else if (!this.aiPlaying && !this.sttInFlight) {
+            this.setState("listening");
+          }
+          this.turnHadStreamedAudio = false;
           break;
+        }
         case "interrupted":
           this.stopPlayback();
           this.setState("listening");
@@ -367,6 +390,7 @@ export class VoiceSessionManager {
     if (!this.audioCtx || !this.playbackGain || !b64) return;
     const float = decodeBase64Pcm16(b64);
     if (float.length === 0) return;
+    this.turnHadStreamedAudio = true;
 
     const chunkMs = (float.length / sampleRate) * 1000;
 

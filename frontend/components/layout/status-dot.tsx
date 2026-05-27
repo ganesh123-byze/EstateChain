@@ -14,18 +14,27 @@ export function StatusDot({ className }: { className?: string }) {
     : degraded
       ? `Degraded — db ${data?.database ?? "?"}, rpc ${data?.rpc ?? "?"}`
       : "Backend unavailable";
+  const framed = Boolean(className?.includes("h-9"));
   return (
     <TooltipProvider delayDuration={150}>
       <Tooltip>
         <TooltipTrigger asChild>
           <span
             className={cn(
-              "relative inline-flex h-2.5 w-2.5 rounded-full",
-              color,
-              className,
+              framed
+                ? "inline-flex items-center justify-center rounded-full border border-border bg-card/50"
+                : cn("relative inline-flex h-2.5 w-2.5 rounded-full", color),
+              framed && className,
+              !framed && className,
             )}
           >
-            <span className={cn("absolute inset-0 rounded-full opacity-60", color, "animate-ping")} />
+            {framed ? (
+              <span className={cn("relative inline-flex h-2.5 w-2.5 rounded-full", color)}>
+                <span className={cn("absolute inset-0 rounded-full opacity-60", color, "animate-ping")} />
+              </span>
+            ) : (
+              <span className={cn("absolute inset-0 rounded-full opacity-60", color, "animate-ping")} />
+            )}
           </span>
         </TooltipTrigger>
         <TooltipContent>{label}</TooltipContent>

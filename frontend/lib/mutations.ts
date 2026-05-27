@@ -26,6 +26,7 @@ export type CreatePropertyStep =
   | "inventory_done"
   | "syncing_rent"
   | "rent_synced"
+  | "rent_sync_skipped"
   | "done"
   | "error";
 
@@ -94,6 +95,7 @@ export function useCreatePropertyStream() {
       let sseBuffer = "";
       let finalProperty: Property | null = null;
       let finalError: string | null = null;
+      let rentSyncWarning: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -115,6 +117,8 @@ export function useCreatePropertyStream() {
             onProgress?.(event);
             if (event.step === "done" && event.property) {
               finalProperty = event.property;
+            } else if (event.step === "rent_sync_skipped") {
+              rentSyncWarning = event.detail || "Rent was not synced on-chain.";
             } else if (event.step === "error") {
               finalError = event.detail || "Property creation failed.";
             }
@@ -124,6 +128,9 @@ export function useCreatePropertyStream() {
 
       if (finalError) throw new Error(finalError);
       if (!finalProperty) throw new Error("Property creation finished without a result.");
+      if (rentSyncWarning) {
+        (finalProperty as Property & { rentSyncWarning?: string }).rentSyncWarning = rentSyncWarning;
+      }
       return finalProperty;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.properties }),

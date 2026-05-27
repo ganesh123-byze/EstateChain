@@ -7,6 +7,9 @@
 .env.*
 !.env.example
 !**/.env.example
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.production.local
 *.pem
 *.key
 *_rsa
@@ -96,6 +99,10 @@ out/
 .turbo/
 .vercel/
 *.tsbuildinfo
+
+# Voice / VAD assets downloaded at runtime (large; not source)
+frontend/public/**/*.onnx
+frontend/public/**/*.wasm
 
 # Generated per deploy / dev (see scripts/generate-runtime-config.js)
 frontend/runtime-config.js

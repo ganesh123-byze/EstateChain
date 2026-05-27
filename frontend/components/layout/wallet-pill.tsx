@@ -14,9 +14,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { logout } from "@/lib/auth";
 import { getSession, type SessionRecord } from "@/lib/api";
-import { shortAddress } from "@/lib/utils";
+import { cn, shortAddress } from "@/lib/utils";
 
-export function WalletPill() {
+export function WalletPill({ className }: { className?: string }) {
   const [session, setSession] = useState<SessionRecord | null>(null);
 
   useEffect(() => {
@@ -47,7 +47,10 @@ export function WalletPill() {
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-foreground/90 transition-colors hover:bg-muted"
+          className={cn(
+            "inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 text-xs font-medium text-foreground/90 transition-colors hover:bg-muted",
+            className,
+          )}
         >
           <MetaMaskIcon size={16} />
           <span className="font-mono tracking-tight">{shortAddress(wallet, 4, 4)}</span>

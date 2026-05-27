@@ -18,7 +18,18 @@ export function RoleGate({ role, children }: { role: Role; children: React.React
         router.replace("/");
         return;
       }
-      const me = await refreshMe();
+      let me: Awaited<ReturnType<typeof refreshMe>> = null;
+      try {
+        me = await Promise.race([
+          refreshMe(),
+          new Promise<null>((_, reject) =>
+            window.setTimeout(() => reject(new Error("Auth check timed out")), 20_000),
+          ),
+        ]);
+      } catch {
+        if (!cancelled) router.replace("/");
+        return;
+      }
       if (cancelled) return;
       if (!me) {
         router.replace("/");

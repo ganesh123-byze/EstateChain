@@ -214,6 +214,14 @@ def ensure_security_token_sale_inventory(property_item: dict) -> None:
     )
 
 
+def property_needs_token_deployment(property_item: dict) -> bool:
+    """True when the property row exists but its SecurityToken is not on-chain yet."""
+    token_address = property_item.get("token_address")
+    if not token_address:
+        return True
+    return not is_investable_token_contract(token_address)
+
+
 def deploy_property_token(cursor, property_item: dict, property_id: int) -> dict:
     """Explicit, admin-initiated SecurityToken deployment for a property."""
     if property_item.get("token_address") and is_investable_token_contract(
@@ -475,6 +483,12 @@ def get_or_create_tenant(cursor, wallet_address: str) -> int:
 
 def ensure_rent_property_registered(cursor, property_item: dict, property_id: int) -> None:
     """Register the property in the RentDistribution singleton if not already active."""
+    from backend.services.blockchain import platform_deployer_mismatch
+
+    mismatch = platform_deployer_mismatch()
+    if mismatch:
+        raise HTTPException(status_code=409, detail=mismatch)
+
     try:
         info = get_rent_property_info(property_id)
         if info["active"]:
@@ -486,7 +500,24 @@ def ensure_rent_property_registered(cursor, property_item: dict, property_id: in
         raise HTTPException(
             status_code=400, detail="Property has no token contract deployed"
         )
-    register_property_for_rent(property_id, token_address)
+    try:
+        register_property_for_rent(property_id, token_address)
+    except Exception as exc:
+        err = str(exc)
+        if "not the owner" in err or "Ownable" in err:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "DEPLOYER_CONTRACT_MISMATCH",
+                    "message": (
+                        "RentDistribution rejected registration: the deployer wallet is not the "
+                        "contract owner. Redeploy platform contracts with the wallet in "
+                        "DEPLOYER_PRIVATE_KEY (`npm run deploy:sepolia`), then update "
+                        "INDEXER_START_BLOCK."
+                    ),
+                },
+            ) from exc
+        raise
 
 
 def sync_investors_to_contract(cursor, property_id: int) -> list[str]:

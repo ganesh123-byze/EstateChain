@@ -11,7 +11,7 @@ from backend.config.settings import (
     EXPECTED_CHAIN_HEX,
     load_contract_addresses,
 )
-from backend.services.blockchain import get_web3
+from backend.services.blockchain import get_web3, platform_deployer_mismatch, rpc_is_healthy
 
 router = APIRouter()
 
@@ -35,10 +35,7 @@ def health(db=Depends(get_db)):
         except Exception:
             pass
 
-    try:
-        rpc_ok = get_web3().is_connected()
-    except Exception:
-        rpc_ok = False
+    rpc_ok = rpc_is_healthy()
 
     # DB is critical; RPC failures are often transient (rate-limit, network).
     if not db_ok:
@@ -66,7 +63,7 @@ def status(db=Depends(get_db)):
             pass
 
     try:
-        rpc_status = "ok" if get_web3().is_connected() else "failed"
+        rpc_status = "ok" if rpc_is_healthy() else "failed"
     except Exception:
         rpc_status = "failed"
 
@@ -76,6 +73,8 @@ def status(db=Depends(get_db)):
     except Exception:
         indexer_status = {"running": False}
 
+    deployer = platform_deployer_mismatch()
+
     return {
         "status": "ok" if db_status == "ok" and rpc_status == "ok" else "degraded",
         "database": db_status,
@@ -84,6 +83,7 @@ def status(db=Depends(get_db)):
         "env": DEPLOY_ENV,
         "chain_id": CHAIN_ID,
         "expected_chain_hex": EXPECTED_CHAIN_HEX,
+        "deployer_warning": deployer,
     }
 
 
@@ -95,6 +95,7 @@ def config():
         "explorerTxBase": "https://sepolia.etherscan.io/tx/",
         "contracts": load_contract_addresses(),
         "env": DEPLOY_ENV,
+        "deployerWarning": platform_deployer_mismatch(),
     }
 
 

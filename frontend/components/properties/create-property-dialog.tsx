@@ -19,6 +19,7 @@ import {
   type CreatePropertyEvent,
   type CreatePropertyStep,
 } from "@/lib/mutations";
+import type { Property } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { PropertyImageUploader } from "@/components/properties/property-image-uploader";
 import {
@@ -196,7 +197,7 @@ export function CreatePropertyDialog() {
     setForm(values);
     try {
       const price = calculateTokenPriceEth(values.total_value, values.token_supply);
-      await create.mutateAsync({
+      const created = await create.mutateAsync({
         payload: {
           name: values.name.trim(),
           location: values.location.trim(),
@@ -216,8 +217,15 @@ export function CreatePropertyDialog() {
       const msg = named
         ? `Property '${named}' created successfully.`
         : "Property created successfully.";
+      const rentWarning = (created as Property & { rentSyncWarning?: string }).rentSyncWarning;
       clearPendingWorkflowActions("CREATE_PROPERTY");
       toast.success(msg);
+      if (rentWarning) {
+        toast.warning(
+          "Token deployed, but rent was not synced. Redeploy platform contracts with your deployer wallet (`npm run deploy:sepolia`), then use Sync Rent Chain on the property.",
+          { duration: 12000 },
+        );
+      }
       emitWorkflowCompletion({
         modal: "CREATE_PROPERTY",
         status: "success",

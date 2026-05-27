@@ -19,8 +19,9 @@ from backend.config.settings import get_database_url
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url with the real DATABASE_URL from settings
-config.set_main_option("sqlalchemy.url", get_database_url())
+# Override sqlalchemy.url with the real DATABASE_URL from settings.
+# ConfigParser treats "%" as interpolation; escape for passwords like Ganesh@29327 → %40.
+config.set_main_option("sqlalchemy.url", get_database_url().replace("%", "%%"))
 
 # add your model's MetaData object here for 'autogenerate' support
 # (Not applicable — this project uses raw psycopg2, not SQLAlchemy ORM.)

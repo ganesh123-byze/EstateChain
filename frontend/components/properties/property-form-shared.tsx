@@ -23,6 +23,18 @@ export const propertyDialogContentClass =
 export const propertyDialogBodyClass =
   "scrollbar-thin flex min-h-0 flex-col gap-4 overflow-y-auto px-6 pb-6 pt-5";
 
+/** Scrollable main area for property detail overview modals (admin / tenant). */
+export const propertyDetailScrollBodyClass =
+  "scrollbar-thin min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain scroll-smooth";
+
+/** Investor detail modal shell — 512px (max-w-lg), height follows content up to min(92vh, 920px). */
+export const investorPropertyDetailDialogClass =
+  "flex h-fit w-full max-w-lg flex-col gap-0 overflow-hidden p-0 max-h-[min(92vh,920px)] sm:rounded-2xl";
+
+/** Investor detail scroll body (reserves ~48px for the pinned Invest footer). */
+export const investorPropertyDetailScrollBodyClass =
+  "scrollbar-thin overflow-x-hidden overflow-y-auto overscroll-contain scroll-smooth max-h-[calc(min(92vh,920px)-3rem)]";
+
 /** Sticky footer styling used at the bottom of property dialogs. */
 export const propertyDialogFooterClass =
   "sticky bottom-0 z-10 flex flex-col-reverse gap-2 border-t border-border/60 bg-card/95 px-6 py-3 backdrop-blur sm:flex-row sm:justify-end";
