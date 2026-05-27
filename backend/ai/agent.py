@@ -179,6 +179,14 @@ async def _call_tools(state: AgentState, user: AuthUser, db: Any) -> dict:
                     result_data["filled_fields"] = result.data["filled"]
                 if result.data and "missing" in result.data:
                     result_data["missing_required"] = result.data["missing"]
+                if result.data and result.data.get("success_message"):
+                    result_data["success_message"] = result.data["success_message"]
+                    result_data["speak_to_user"] = result.data.get(
+                        "speak_to_user", result.data["success_message"]
+                    )
+                    result_data["instruction"] = (
+                        "Tell the user the success_message verbatim in a natural sentence."
+                    )
                 content = json.dumps(result_data, default=str)
                 tool_results.append(
                     ToolMessage(content=content, tool_call_id=tid, name=name)

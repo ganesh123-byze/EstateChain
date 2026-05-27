@@ -11,6 +11,7 @@ from psycopg2.extras import Json
 
 from backend.api._helpers import (
     add_transaction_row,
+    create_property_record,
     deploy_property_token,
     enrich_property_with_supply,
     ensure_security_token_sale_inventory,
@@ -178,52 +179,14 @@ def create_property(
     After the DB row is inserted, ``_finalize_new_property`` deploys the SecurityToken,
     repairs sale inventory, and syncs rent chain state when monthly rent is set.
     """
-    if payload.token_supply <= 0:
-        raise HTTPException(status_code=400, detail="token_supply must be > 0")
-
-    token_price_wei = str(to_wei(_token_sale_price_eth(payload)))
-    monthly_rent_wei = (
-        str(to_wei(payload.monthly_rent_eth)) if payload.monthly_rent_eth is not None else None
-    )
-
-    cursor = db.cursor(dictionary=True)
-    owner_wallet = normalize_address(user.wallet_address)
     try:
-        existing_property = find_existing_property(
-            cursor, payload, token_price_wei, monthly_rent_wei, owner_wallet
-        )
-        if existing_property:
-            if property_needs_token_deployment(existing_property):
-                property_id = int(existing_property["id"])
-                db.commit()
-                _finalize_new_property(db, property_id)
-                cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-                return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
-            return enrich_property_with_supply(cursor, existing_property, viewer=user)
-
-        cursor.execute(
-            "INSERT INTO properties (name, location, total_value, token_supply, token_symbol, "
-            "token_price_base, monthly_rent_wei, owner_wallet, images) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-            (
-                payload.name, payload.location, payload.total_value,
-                payload.token_supply, payload.token_symbol,
-                token_price_wei, monthly_rent_wei, owner_wallet, Json(payload.images),
-            ),
-        )
-        property_id = int(cursor.fetchone()["id"])
-        db.commit()
-        _finalize_new_property(db, property_id)
-        cursor.execute("SELECT * FROM properties WHERE id = %s", (property_id,))
-        return enrich_property_with_supply(cursor, cursor.fetchone(), viewer=user)
+        return create_property_record(db, user, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
-        db.rollback()
         raise
     except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 def _sse(event: dict[str, Any]) -> str:

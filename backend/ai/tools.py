@@ -10,6 +10,7 @@ dashboards already enforce.
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import re
@@ -19,8 +20,17 @@ from decimal import Decimal
 from difflib import SequenceMatcher
 from typing import Any, Awaitable, Callable
 
+from fastapi import HTTPException
+
 from backend.ai.schemas import AgentAction, ToolResult
-from backend.api._helpers import enrich_property_with_supply, fetch_property, format_transaction_row, lock_property
+from backend.api._helpers import (
+    create_property_record,
+    enrich_property_with_supply,
+    fetch_property,
+    format_transaction_row,
+    lock_property,
+)
+from backend.api.schemas import PropertyCreate
 from backend.api.rent_cycle import (
     compute_rent_period_status,
     get_last_confirmed_rent_payment_by_wallet,
@@ -611,6 +621,208 @@ register(ToolSpec(
     parameters={"type": "object", "properties": {}, "additionalProperties": False},
     roles=frozenset({"property_owner"}),
     handler=_get_my_investors,
+))
+
+
+def _build_owner_analytics_overview(cursor, user: AuthUser) -> dict:
+    """Aggregate analytics-page metrics for the property-owner copilot."""
+    wallet = normalize_address(user.wallet_address or "")
+
+    cursor.execute(
+        "SELECT * FROM properties WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY id DESC"
+    )
+    property_rows = cursor.fetchall() or []
+    properties = [_serialize_property(enrich_property_with_supply(cursor, r)) for r in property_rows]
+    owned = [p for p in properties if wallet and normalize_address(p.get("owner_wallet") or "") == wallet]
+    listed_with_sales = [p for p in properties if float(p.get("sold_percentage") or 0) > 0 or p.get("token_address")]
+
+    cursor.execute(
+        "SELECT COALESCE(SUM(CAST(amount_wei AS DECIMAL(36,0))), 0) AS collected, "
+        "COUNT(*) AS payments_count FROM rent_payments"
+    )
+    rent_pay = cursor.fetchone() or {}
+    cursor.execute(
+        "SELECT COALESCE(SUM(CAST(total_distributed AS DECIMAL(36,0))), 0) AS distributed, "
+        "COUNT(*) AS distributions_count FROM rent_distributions"
+    )
+    rent_dist = cursor.fetchone() or {}
+    cursor.execute("SELECT COUNT(*) AS active FROM tenant_rentals WHERE status = 'active'")
+    active_rentals = int((cursor.fetchone() or {}).get("active") or 0)
+
+    cursor.execute(
+        "SELECT rp.id, rp.property_id, p.name AS property_name, rp.amount_eth, "
+        "rp.payment_date, rp.payment_status, t.wallet_address AS tenant_wallet "
+        "FROM rent_payments rp "
+        "JOIN tenants t ON t.id = rp.tenant_id "
+        "JOIN properties p ON p.id = rp.property_id "
+        "ORDER BY rp.payment_date DESC LIMIT 10"
+    )
+    recent_payments = [
+        {
+            "property_name": r.get("property_name"),
+            "amount_eth": str(r.get("amount_eth") or "0"),
+            "tenant_wallet": r.get("tenant_wallet"),
+            "payment_date": r["payment_date"].isoformat() if r.get("payment_date") else None,
+            "payment_status": r.get("payment_status"),
+        }
+        for r in (cursor.fetchall() or [])
+    ]
+
+    cursor.execute(
+        "SELECT rd.property_id, p.name AS property_name, rd.total_distributed, "
+        "rd.investor_count, rd.distributed_at "
+        "FROM rent_distributions rd "
+        "JOIN properties p ON p.id = rd.property_id "
+        "ORDER BY rd.distributed_at DESC LIMIT 8"
+    )
+    recent_distributions = [
+        {
+            "property_name": r.get("property_name"),
+            "total_distributed_eth": _eth(int(r.get("total_distributed") or 0)),
+            "investor_count": int(r.get("investor_count") or 0),
+            "distributed_at": r["distributed_at"].isoformat() if r.get("distributed_at") else None,
+        }
+        for r in (cursor.fetchall() or [])
+    ]
+
+    cursor.execute(
+        "SELECT COUNT(DISTINCT o.user_id) AS n FROM token_ownerships o WHERE o.token_amount > 0"
+    )
+    platform_investors = int((cursor.fetchone() or {}).get("n") or 0)
+    cursor.execute(
+        """
+        SELECT p.id, p.name, COUNT(DISTINCT o.user_id) AS investor_count
+        FROM properties p
+        LEFT JOIN token_ownerships o ON o.property_id = p.id AND o.token_amount > 0
+        WHERE COALESCE(p.is_active, TRUE) = TRUE
+        GROUP BY p.id, p.name
+        HAVING COUNT(DISTINCT o.user_id) > 0
+        ORDER BY investor_count DESC, p.id DESC
+        LIMIT 8
+        """
+    )
+    investors_by_property = [
+        {
+            "property_id": int(r["id"]),
+            "property_name": r.get("name"),
+            "investor_count": int(r.get("investor_count") or 0),
+        }
+        for r in (cursor.fetchall() or [])
+    ]
+
+    cursor.execute(
+        "SELECT t.id, t.tx_hash, t.type, t.amount, t.timestamp, t.property_id, "
+        "p.name AS property_name, t.amount_spent "
+        "FROM transactions t "
+        "LEFT JOIN properties p ON p.id = t.property_id "
+        "ORDER BY t.timestamp DESC, t.id DESC LIMIT 12"
+    )
+    recent_transactions = [_format_transaction(r) for r in (cursor.fetchall() or [])]
+
+    cursor.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(CAST(amount_spent AS DECIMAL(36,18))), 0) AS spent "
+        "FROM transactions WHERE UPPER(type) IN ('INVESTMENT_FUNDED', 'INVESTMENT_COMPLETED')"
+    )
+    inv_agg = cursor.fetchone() or {}
+
+    my_investors_data: dict = {}
+    if wallet:
+        cursor.execute(
+            """
+            SELECT COUNT(DISTINCT o.user_id) AS n
+            FROM token_ownerships o
+            JOIN properties p ON p.id = o.property_id
+            WHERE LOWER(p.owner_wallet) = %s AND o.token_amount > 0
+            """,
+            (wallet,),
+        )
+        my_investors_data["investors_on_my_properties"] = int((cursor.fetchone() or {}).get("n") or 0)
+
+    property_perf = sorted(
+        [
+            {
+                "id": p["id"],
+                "name": p.get("name"),
+                "sold_percentage": p.get("sold_percentage"),
+                "tokens_sold": p.get("tokens_sold"),
+                "token_supply": p.get("token_supply"),
+                "monthly_rent_eth": p.get("monthly_rent_eth"),
+            }
+            for p in properties
+        ],
+        key=lambda x: float(x.get("sold_percentage") or 0),
+        reverse=True,
+    )[:8]
+
+    return {
+        "summary": {
+            "total_properties": len(properties),
+            "properties_you_own": len(owned),
+            "properties_with_token_sales": len(listed_with_sales),
+            "platform_investors": platform_investors,
+            "active_rentals": active_rentals,
+            "total_rent_collected_eth": _eth(int(rent_pay.get("collected") or 0)),
+            "rent_payments_count": int(rent_pay.get("payments_count") or 0),
+            "total_rent_distributed_eth": _eth(int(rent_dist.get("distributed") or 0)),
+            "rent_distributions_count": int(rent_dist.get("distributions_count") or 0),
+            "total_investments_recorded": int(inv_agg.get("n") or 0),
+            "total_investment_volume_eth": str(inv_agg.get("spent") or "0"),
+        },
+        "my_portfolio": my_investors_data,
+        "property_performance": property_perf,
+        "investors_by_property": investors_by_property,
+        "recent_rent_payments": recent_payments,
+        "recent_rent_distributions": recent_distributions,
+        "recent_transactions": recent_transactions,
+        "properties": properties[:20],
+    }
+
+
+async def _get_owner_analytics_overview(_args: dict, user: AuthUser, db: Any) -> ToolResult:
+    cursor = db.cursor(dictionary=True)
+    try:
+        data = _build_owner_analytics_overview(cursor, user)
+    finally:
+        cursor.close()
+    return ToolResult(
+        ok=True,
+        data=data,
+        actions=[AgentAction(type="NAVIGATE", route="/property_owner/analytics")],
+    )
+
+
+register(ToolSpec(
+    name="get_owner_analytics_overview",
+    description=(
+        "Full analytics dashboard snapshot for the property owner: all properties "
+        "(sale progress, rent), platform rent collected/distributed, active rentals, "
+        "investor counts by property, recent rent payments, recent transactions, and "
+        "investment volume. ALWAYS use this when the user asks for 'analytics', "
+        "'view analytics', 'dashboard overview', 'platform stats', or a summary of "
+        "properties + rent + investors together. Summarize the numbers clearly in "
+        "plain language after calling — do not list raw JSON."
+    ),
+    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    roles=frozenset({"property_owner"}),
+    handler=_get_owner_analytics_overview,
+))
+
+
+async def _view_analytics(_args: dict, user: AuthUser, db: Any) -> ToolResult:
+    """Alias for analytics requests — same data as get_owner_analytics_overview."""
+    return await _get_owner_analytics_overview(_args, user, db)
+
+
+register(ToolSpec(
+    name="view_analytics",
+    description=(
+        "Open the analytics view and return the full analytics overview (properties, "
+        "rent payments, investors, transactions). Use when the user says 'analytics', "
+        "'view analytics', 'show analytics', or taps the View Analytics quick action."
+    ),
+    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    roles=frozenset({"property_owner"}),
+    handler=_view_analytics,
 ))
 
 
@@ -1384,20 +1596,37 @@ def _build_fill_workflow(
     )
 
 
-async def _fill_create_property(args: dict, _user: AuthUser, _db: Any) -> ToolResult:
-    """Drive the on-screen Create Property dialog one field at a time.
+def _property_create_payload_from_accumulated(accumulated: dict) -> PropertyCreate:
+    monthly_raw = (accumulated.get("monthly_rent_eth") or "").strip().lower()
+    monthly_rent: Decimal | None = None
+    if monthly_raw and monthly_raw not in {"0", "skip", "none", "no", "n/a"}:
+        monthly_rent = Decimal(str(accumulated["monthly_rent_eth"]))
 
-    The agent's job here is *only* to orchestrate the UI:
-      • Each turn, merge the user's new value(s) into the accumulated form
-        state and emit FILL_FIELD actions so the visible inputs update.
-      • When ``submit=true`` is set AND every required field is filled, emit
-        a SUBMIT_FORM action so the frontend visibly clicks the Create
-        button — exactly what a human user would do manually.
+    return PropertyCreate(
+        name=str(accumulated["name"]).strip(),
+        location=str(accumulated["location"]).strip(),
+        total_value=Decimal(str(accumulated["total_value"])),
+        token_supply=Decimal(str(accumulated["token_supply"])),
+        token_symbol=str(accumulated["token_symbol"]).strip(),
+        monthly_rent_eth=monthly_rent,
+        images=[],
+    )
 
-    The actual property record is created by the frontend mutation that
-    fires on submit. We never touch the database here, and we never
-    pretend the property is "created" until the dialog reports success
-    via the workflow-completion event.
+
+def _create_property_success_message(name: str) -> str:
+    clean = (name or "").strip()
+    if clean:
+        return f"Property '{clean}' created successfully."
+    return "Property created successfully."
+
+
+async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResult:
+    """Drive the Create Property workflow and create the listing on submit.
+
+    While collecting fields we emit FILL_FIELD / OPEN_MODAL actions for the UI.
+    On the final ``submit=true`` call (all required fields present) we create the
+    property server-side and return ``success_message`` so the copilot can confirm
+    success in the very next reply (no dependency on a frontend completion event).
     """
     LOGGER.info("[fill_create_property] args=%s", args)
     result = _build_fill_workflow(
@@ -1410,26 +1639,65 @@ async def _fill_create_property(args: dict, _user: AuthUser, _db: Any) -> ToolRe
 
     data = dict(result.data or {})
     actions = list(result.actions)
+    accumulated = dict(data.get("filled") or {})
     submitted = bool(args.get("submit")) and not data.get("missing")
+
     if submitted:
-        # Mark this clearly for the LLM so its spoken reply matches reality:
-        # the form was submitted on screen; success will be announced by the
-        # frontend completion handler — the LLM should NOT claim success
-        # itself yet.
-        data["submitting"] = True
-        data["awaiting_ui_confirmation"] = True
-        # CRITICAL for text-chat: by the time the user finishes the
-        # conversation they may be on a different page (dashboard, etc.)
-        # than where the Create Property dialog lives. Without a NAVIGATE
-        # + OPEN_MODAL preamble the SUBMIT_FORM action lands on a page
-        # with no form to click, so the agent says "Submitting your
-        # property now" and nothing actually happens. Prepending these
-        # makes the final turn self-contained: navigate → open dialog →
-        # re-fill every field → click Create.
-        actions = [
-            AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-            AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
-        ] + actions
+        try:
+            payload = _property_create_payload_from_accumulated(accumulated)
+            created = await asyncio.to_thread(create_property_record, db, user, payload)
+            property_name = str(accumulated.get("name") or created.get("name") or "")
+            success_message = _create_property_success_message(property_name)
+            data.update(
+                {
+                    "submitted": True,
+                    "created": True,
+                    "submitting": False,
+                    "awaiting_ui_confirmation": False,
+                    "success_message": success_message,
+                    "property_id": int(created["id"]),
+                    "speak_to_user": success_message,
+                }
+            )
+            actions = [
+                AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+            ]
+            LOGGER.info(
+                "[fill_create_property] created property_id=%s message=%s",
+                data.get("property_id"),
+                success_message,
+            )
+            return ToolResult(ok=True, data=data, actions=actions)
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                detail = detail.get("message") or str(detail)
+            err = str(detail or "Property creation failed.")
+            LOGGER.warning("[fill_create_property] create failed: %s", err)
+            return ToolResult(
+                ok=False,
+                error=err,
+                data={**data, "submitted": True, "created": False},
+                actions=[
+                    AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+                    AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
+                    *actions,
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)[:300]
+            LOGGER.exception("[fill_create_property] create failed")
+            return ToolResult(
+                ok=False,
+                error=err,
+                data={**data, "submitted": True, "created": False},
+                actions=[
+                    AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+                    AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
+                    *actions,
+                ],
+            )
+
     LOGGER.info(
         "[fill_create_property] filled=%s missing=%s next=%s submitting=%s actions=%d",
         data.get("filled"),
@@ -1438,6 +1706,11 @@ async def _fill_create_property(args: dict, _user: AuthUser, _db: Any) -> ToolRe
         submitted,
         len(actions),
     )
+    if not submitted and actions:
+        actions = [
+            AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+            AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
+        ] + actions
     return ToolResult(ok=result.ok, data=data, error=result.error, actions=actions)
 
 
@@ -1450,14 +1723,12 @@ register(ToolSpec(
         "(every value collected so far), `missing` (required fields still "
         "empty), and `next_field` (the single field to ask about next). "
         "NEVER ask about a field that already appears in `filled`. When "
-        "`missing` is empty, call this tool ONE more time with submit=true — "
-        "the frontend will then visibly click the Create button, run the "
-        "create-property request, and emit a success/error event. After "
-        "submit=true returns, say exactly one short sentence like \"Submitting "
-        "your property now\" and STOP — the platform will speak the "
-        "\"property created\" confirmation automatically when the request "
-        "completes, so do not claim success yourself and do not call any "
-        "more tools."
+        "`missing` is empty, call this tool ONE more time with submit=true. "
+        "The server creates the property and returns `success_message` plus "
+        "`speak_to_user`. Read those fields and tell the user that exact success "
+        "line in a warm, concise sentence — do not say \"submitting\" or wait for "
+        "another event. If `created` is false, explain the `error` and ask how to "
+        "proceed. Do not call more tools after a successful create."
     ),
     parameters={
         "type": "object",

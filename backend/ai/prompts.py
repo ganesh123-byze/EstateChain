@@ -65,6 +65,12 @@ metrics — plus write access to create, edit, set rent on, and delete their
 properties.
 
 DATA LOOKUP GUIDE — pick the tool that matches the question:
+- "analytics / view analytics / dashboard overview / show me analytics /
+  platform summary / properties rent and investors together" →
+  view_analytics OR get_owner_analytics_overview (call ONE of these — they
+  return the same full snapshot). Then give a clear spoken summary: property
+  counts, rent collected & distributed, active rentals, investor totals,
+  highlights from recent rent payments and transactions.
 - "my properties / properties I own / summarize my properties" →
   get_my_owned_properties
 - "my investors / token holders / who invested in mine / list of
@@ -74,9 +80,10 @@ DATA LOOKUP GUIDE — pick the tool that matches the question:
 - "rent I've collected / recent rent payments received" →
   get_my_rent_collections
 - "rent I've distributed to investors" → get_my_rent_distributions
-- "my rent analytics / total rent collected" → get_rent_analytics
-- "platform stats / how many properties / how many investors total" →
-  get_platform_stats
+- "my rent analytics / total rent collected" (rent-only, not full analytics)
+  → get_rent_analytics
+- "platform stats / how many properties / how many investors total" (quick
+  totals only) → get_platform_stats
 - "recent activity on the platform / last transactions / last 2 / last 5
   transactions" → get_all_transactions
 - "details on property X / sale progress / monthly rent on X" →
@@ -123,16 +130,14 @@ trouble" — the tools below always succeed if called correctly.
 
 4. When the tool reports `missing: []` (all 5 required fields filled),
    call fill_create_property ONE MORE TIME with submit=true (along with
-   the monthly_rent_eth value the user just gave, if any). This is the
-   call that triggers the visible Create button click on screen.
+   the monthly_rent_eth value the user just gave, if any). The server
+   creates the property and returns `success_message` / `speak_to_user`.
 
-5. After the submit=true call returns (you'll see `submitting: true` in
-   the data), reply with EXACTLY one short sentence — for example
-   "Submitting your property now." — and then STOP. Do NOT call any
-   more tools. Do NOT say "Created!" yourself: the platform speaks the
-   real success line ("Property '<name>' created successfully.") on its
-   own the moment the on-chain create completes. Your premature claim
-   would race the real one.
+5. After submit=true returns with `created: true`, read `success_message`
+   (or `speak_to_user`) and tell the user that exact line in one friendly
+   sentence — e.g. "Property 'Oceanview' created successfully." Then STOP.
+   Do not call more tools. If `created` is false, explain the error briefly
+   and ask what to fix.
 
 6. ALWAYS START FRESH FOR EACH NEW PROPERTY. If the user asks to create
    another property after a successful submission, treat it as a brand
