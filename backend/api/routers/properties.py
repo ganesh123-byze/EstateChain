@@ -167,15 +167,6 @@ def _assert_owner(user: AuthUser, property_item: dict) -> None:
         raise HTTPException(status_code=403, detail="You can only modify properties you own.")
 
 
-def _assert_property_owner_can_view(user: AuthUser, property_item: dict) -> None:
-    """Property owners may only read listings they created (by wallet)."""
-    owner = normalize_address(property_item.get("owner_wallet") or "")
-    if not owner:
-        raise HTTPException(status_code=403, detail="Property owner not assigned.")
-    if not property_is_owned_by(property_item, user.wallet_address):
-        raise HTTPException(status_code=403, detail="You can only view properties you own.")
-
-
 @router.post("/properties", response_model=PropertyRead)
 def create_property(
     payload: PropertyCreate,
@@ -416,24 +407,15 @@ def list_properties(
 ):
     """List active properties.
 
-    When the caller is authenticated as ``property_owner``, only properties
-    owned by that wallet are returned so the admin UI cannot surface another
-    owner's edit/delete controls.
+    All property owners see every listing. ``apply_property_visibility`` clears
+    ``owner_wallet`` on rows the viewer does not own so the admin UI hides
+    edit/delete without blocking catalog visibility.
     """
     cursor = db.cursor(dictionary=True)
     try:
-        if user and user.role.lower() == "property_owner":
-            owner_wallet = normalize_address(user.wallet_address)
-            cursor.execute(
-                "SELECT * FROM properties WHERE COALESCE(is_active, TRUE) = TRUE "
-                "AND LOWER(COALESCE(owner_wallet, '')) = %s "
-                "ORDER BY id DESC",
-                (owner_wallet,),
-            )
-        else:
-            cursor.execute(
-                "SELECT * FROM properties WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY id DESC",
-            )
+        cursor.execute(
+            "SELECT * FROM properties WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY id DESC",
+        )
         rows = cursor.fetchall()
         return [enrich_property_with_supply(cursor, row, viewer=user) for row in rows]
     finally:
@@ -451,8 +433,6 @@ def get_property(
         property_item = fetch_property(cursor, property_id)
         if not property_item:
             raise HTTPException(status_code=404, detail="Property not found")
-        if user and user.role.lower() == "property_owner":
-            _assert_property_owner_can_view(user, property_item)
         return enrich_property_with_supply(cursor, property_item, viewer=user)
     finally:
         cursor.close()
