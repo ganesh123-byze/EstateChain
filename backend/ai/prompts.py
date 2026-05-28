@@ -285,33 +285,34 @@ DATA LOOKUP GUIDE:
   get_all_transactions
 - "platform stats / how many properties total" → get_platform_stats
 
-WORKFLOW — Pay rent:
+WORKFLOW — Pay rent (guided):
 
-The source of truth for "what can I pay rent on" is
-list_properties with rent_enabled_only=true — NOT get_my_active_rentals.
-The tenant_rentals table only records rentals after the first payment, so
-first-time payers won't show up there. Always use the rent-enabled list.
+Use start_pay_rent_property + fill_pay_rent_property — same pattern as
+guided invest. The server syncs the rent contract before MetaMask opens.
 
-1. "pay the rent" with no property named:
-   a. Call list_properties with rent_enabled_only=true.
-   b. If exactly one rent-enabled property is returned, use its
-      property_id automatically — do NOT ask the user which one.
-   c. If multiple, ask briefly: "Which property — A, B, or C?"
-   d. If zero, tell them no properties have rent enabled yet.
-2. "pay rent on <property name>":
-   - Call list_properties with rent_enabled_only=true and find the match.
-     If found, use it. If not found, say the property has no rent set.
-3. Then call start_pay_rent with the property_id. Reply: "Confirm the
-   transaction in MetaMask." Do not ask them to press any button.
+1. User wants to pay rent (with or without naming a property):
+   → start_pay_rent_property, then fill_pay_rent_property on each answer.
+2. Pass only NEW field values each turn; the server merges prior turns.
+3. When property_name is collected, fill_pay_rent_property auto-submits
+   (or call with submit=true). Reply: "Confirm the transaction in MetaMask."
+   Do not ask them to press any button on the page.
+
+Shortcut: if you already resolved a single rent-enabled property via
+list_properties (rent_enabled_only=true), you may call start_pay_rent with
+property_id or property_name instead. list_properties is still the source of
+truth for what is rentable — NOT get_my_active_rentals (first-time payers
+won't appear there until after their first payment).
+
+SYNC / PREPARE ERRORS:
+- If fill_pay_rent_property or start_pay_rent returns sync_failed or a
+  deployer/contract error, explain it in plain language and do NOT retry
+  MetaMask. Tell the user the property owner must set rent and run Sync
+  Rent Chain (or redeploy platform contracts).
 
 ALREADY-PAID HANDLING:
-- If start_pay_rent returns an error with ``already_paid: true`` in its
-  data, do NOT retry start_pay_rent and do NOT ask the user to confirm
-  anything in MetaMask. The wallet must not open. Reply with exactly one
-  short sentence confirming the rent is already paid for this period and
-  mention the next due date from ``next_due_label`` (or ``next_due_at``).
-  Example: "You're all set — rent for Oceanview Apartments is paid for
-  this cycle. Next due June 21, 2026."
+- If any pay-rent tool returns ``already_paid: true`` in its data, do NOT
+  retry and do NOT ask the user to confirm in MetaMask. Reply with one short
+  sentence that rent is paid for this period and mention next_due_label.
 
 Cross-role requests on this dashboard:
 - If the user asks to "invest" / "buy tokens", explain that investments

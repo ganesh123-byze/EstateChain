@@ -35,9 +35,13 @@ from backend.ai.schemas import AgentAction, ToolResult
 from backend.api._helpers import (
     create_property_record,
     enrich_property_with_supply,
+    ensure_rent_property_registered,
     fetch_property,
     format_transaction_row,
     lock_property,
+    require_property_token,
+    sync_investors_to_contract,
+    sync_rent_amount_to_contract,
 )
 from backend.api.schemas import PropertyCreate
 from backend.api.rent_cycle import (
@@ -390,6 +394,62 @@ def _resolve_investable_property_from_items(
     if len(strong) > 1 and (strong[0][0] - strong[1][0]) < 0.08:
         names = ", ".join((p.get("name") or f"#{p.get('id')}") for _, p in strong[:3])
         return None, f"Several investable properties match {q!r}: {names}. Which one do you mean?"
+
+    return strong[0][1], None
+
+
+def _validate_property_rentable(prop: dict) -> str | None:
+    rent_wei = str(prop.get("monthly_rent_wei") or "0")
+    if rent_wei in ("", "0"):
+        name = prop.get("name") or "This property"
+        return f"{name} does not have monthly rent set yet — ask the owner to enable rent first."
+    try:
+        require_property_token(prop)
+    except HTTPException as exc:
+        detail = exc.detail
+        return str(detail) if detail else "Property token contract is not deployed."
+    return None
+
+
+def _resolve_rentable_property_from_items(
+    items: list[dict], query: str
+) -> tuple[dict | None, str | None]:
+    """Resolve a spoken property query to a single rent-enabled listing."""
+    q = (query or "").strip()
+    if not q:
+        return None, "Property name is required."
+
+    rentable: list[dict] = []
+    for prop in items:
+        if prop.get("rent_enabled") and _validate_property_rentable(prop) is None:
+            rentable.append(prop)
+
+    if not rentable:
+        return None, (
+            "No rent-enabled properties are available right now. "
+            "Ask the owner to set monthly rent on a property first."
+        )
+
+    ranked = sorted(
+        [(_property_match_score(q, p), p) for p in rentable],
+        key=lambda item: (item[0], int(item[1].get("id") or 0)),
+        reverse=True,
+    )
+    strong = [(score, prop) for score, prop in ranked if score >= 0.72]
+    if not strong:
+        best_score, _best_prop = ranked[0]
+        if best_score < 0.58:
+            examples = ", ".join((p.get("name") or f"#{p.get('id')}") for _, p in ranked[:3])
+            return None, (
+                f"No rent-enabled property found matching {q!r}. "
+                f"Try one of: {examples}."
+            )
+        options = ", ".join((p.get("name") or f"#{p.get('id')}") for _, p in ranked[:3])
+        return None, f"Please confirm which property you mean: {options}."
+
+    if len(strong) > 1 and (strong[0][0] - strong[1][0]) < 0.08:
+        names = ", ".join((p.get("name") or f"#{p.get('id')}") for _, p in strong[:3])
+        return None, f"Several rent-enabled properties match {q!r}: {names}. Which one do you mean?"
 
     return strong[0][1], None
 
@@ -2643,76 +2703,464 @@ register(ToolSpec(
 ))
 
 
-async def _start_pay_rent(args: dict, user: AuthUser, db: Any) -> ToolResult:
-    pid = args.get("property_id")
-    if not pid:
-        return ToolResult(ok=False, error="property_id is required.")
+_PAY_RENT_MODAL = "PAY_RENT"
+_PAY_RENT_FIELDS = ("property_name",)
+_PAY_RENT_REQUIRED = ("property_name",)
+
+
+def pay_rent_workflow_session() -> dict:
+    """Current guided pay-rent session for this thread."""
+    return _get_workflow_session(_PAY_RENT_MODAL)
+
+
+def _ensure_rent_chain_ready_for_payment(cursor, property_item: dict, property_id: int) -> int:
+    """Register property, sync rent amount, and sync investors before tenant pays."""
+    ensure_rent_property_registered(cursor, property_item, property_id)
+    sync_rent_amount_to_contract(cursor, property_item, property_id)
+    synced = sync_investors_to_contract(cursor, property_id)
+    return len(synced)
+
+
+def _resolve_property_for_rent(db: Any, name: str) -> tuple[dict | None, str | None]:
+    """Fuzzy-match a spoken property name to a single rent-enabled listing."""
+    query = (name or "").strip()
     cursor = db.cursor(dictionary=True)
     try:
-        prop = fetch_property(cursor, int(pid))
+        items = _list_properties(cursor)
+    finally:
+        cursor.close()
+    return _resolve_rentable_property_from_items(items, query)
+
+
+def _pay_rent_actions_on_submit(property_id: int) -> list[AgentAction]:
+    pid = int(property_id)
+    return [
+        AgentAction(type="NAVIGATE", route="/tenant/rentals"),
+        AgentAction(type="OPEN_MODAL", modal=_PAY_RENT_MODAL, property_id=pid),
+        AgentAction(type="SUBMIT_FORM", modal=_PAY_RENT_MODAL, property_id=pid),
+    ]
+
+
+def _rent_period_already_paid_result(prop: dict, period: dict) -> ToolResult:
+    next_due = period.get("next_due_at")
+    next_due_iso = next_due.isoformat() if next_due else None
+    next_due_label = next_due.strftime("%B %d, %Y") if next_due else "next cycle"
+    pid = int(prop["id"])
+    return ToolResult(
+        ok=False,
+        error=(
+            f"Rent for {prop['name']} is already paid for this cycle — "
+            f"next due {next_due_label}."
+        ),
+        data={
+            "already_paid": True,
+            "property_id": pid,
+            "property_name": prop["name"],
+            "next_due_at": next_due_iso,
+            "next_due_label": next_due_label,
+            "rent_cycle_label": period.get("rent_cycle_label"),
+        },
+    )
+
+
+def _http_detail_message(detail: Any) -> str:
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail)
+    return str(detail)
+
+
+async def _execute_pay_rent_ui(property_id: int, user: AuthUser, db: Any) -> ToolResult:
+    """Validate rent status, sync on-chain rent state, then open MetaMask via the UI."""
+    pid = int(property_id)
+    cursor = db.cursor(dictionary=True)
+    try:
+        prop = fetch_property(cursor, pid)
         if not prop:
             return ToolResult(ok=False, error=f"Property {pid} not found.")
-        if not (prop.get("monthly_rent_wei") and str(prop["monthly_rent_wei"]) != "0"):
-            return ToolResult(
-                ok=False,
-                error="Rent has not been set on this property yet — ask the owner to set it first.",
-            )
-        # Short-circuit if the tenant has already paid for the current cycle.
-        # We must NEVER open MetaMask in this case — the LLM should explain
-        # the rent is paid and surface the next due date.
+        if not prop.get("is_active", True):
+            return ToolResult(ok=False, error=f"Property {pid} is not available.")
+
+        prop = enrich_property_with_supply(cursor, prop)
+        serialized = _serialize_property(prop)
+        rent_err = _validate_property_rentable(serialized)
+        if rent_err:
+            return ToolResult(ok=False, error=rent_err)
+
         last_payment = None
-        try:
-            if user and user.wallet_address:
+        if user and user.wallet_address:
+            try:
                 last_payment = get_last_confirmed_rent_payment_by_wallet(
-                    cursor, user.wallet_address, int(pid)
+                    cursor, user.wallet_address, pid
                 )
-        except Exception:  # noqa: BLE001
-            last_payment = None
+            except Exception:  # noqa: BLE001
+                last_payment = None
         period = compute_rent_period_status(last_payment)
         if period.get("current_cycle_paid"):
-            next_due = period.get("next_due_at")
-            next_due_iso = next_due.isoformat() if next_due else None
-            next_due_label = (
-                next_due.strftime("%B %d, %Y") if next_due else "next cycle"
-            )
+            return _rent_period_already_paid_result(serialized, period)
+
+        from backend.services.blockchain import get_rent_property_info, platform_deployer_mismatch
+
+        mismatch = platform_deployer_mismatch()
+        if mismatch:
             return ToolResult(
                 ok=False,
                 error=(
-                    f"Rent for {prop['name']} is already paid for this cycle — "
-                    f"next due {next_due_label}."
+                    f"{mismatch.get('message')} "
+                    "Rent cannot be prepared until platform contracts are redeployed "
+                    "with the wallet in DEPLOYER_PRIVATE_KEY."
                 ),
-                data={
-                    "already_paid": True,
-                    "property_id": int(pid),
-                    "property_name": prop["name"],
-                    "next_due_at": next_due_iso,
-                    "next_due_label": next_due_label,
-                    "rent_cycle_label": period.get("rent_cycle_label"),
-                },
+                data={"sync_failed": True, "deployer_mismatch": True},
+            )
+
+        try:
+            synced_count = _ensure_rent_chain_ready_for_payment(cursor, prop, pid)
+            if synced_count and hasattr(db, "commit"):
+                db.commit()
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict) and detail.get("code") == "DEPLOYER_CONTRACT_MISMATCH":
+                return ToolResult(
+                    ok=False,
+                    error=(
+                        f"{detail.get('message')} "
+                        "Ask the property owner to redeploy platform contracts and run "
+                        "Sync Rent Chain on this property."
+                    ),
+                    data={"sync_failed": True},
+                )
+            return ToolResult(
+                ok=False,
+                error=_http_detail_message(detail),
+                data={"sync_failed": True},
+            )
+        except Exception as sync_exc:  # noqa: BLE001
+            err = str(sync_exc)
+            LOGGER.warning(
+                "execute_pay_rent_ui stage=sync_failed property_id=%s error=%s",
+                pid,
+                sync_exc,
+            )
+            if "not the owner" in err or "Ownable" in err:
+                return ToolResult(
+                    ok=False,
+                    error=(
+                        "Rent contract sync failed: the backend deployer wallet is not the owner "
+                        "of RentDistribution. The property owner must redeploy platform contracts "
+                        "with the correct DEPLOYER_PRIVATE_KEY, then use Sync Rent Chain."
+                    ),
+                    data={"sync_failed": True},
+                )
+            return ToolResult(
+                ok=False,
+                error=(
+                    f"Could not sync rent contract before payment: {sync_exc}. "
+                    "Ask the property owner to verify rent setup."
+                ),
+                data={"sync_failed": True},
+            )
+
+        try:
+            info = get_rent_property_info(pid)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(
+                ok=False,
+                error=f"Failed to read on-chain rent info: {exc}",
+                data={"sync_failed": True},
+            )
+
+        if not info.get("active"):
+            return ToolResult(
+                ok=False,
+                error=(
+                    "Property is not registered on RentDistribution after sync. "
+                    "Ask the owner to set rent and run Sync Rent Chain."
+                ),
+                data={"sync_failed": True},
+            )
+        rent_wei = int(info.get("monthly_rent_wei") or 0)
+        if rent_wei == 0:
+            return ToolResult(
+                ok=False,
+                error="Monthly rent on-chain is zero. The property owner must set rent first.",
+                data={"sync_failed": True},
             )
     finally:
         cursor.close()
+
+    speak = (
+        f"Opening rent payment for {serialized['name']}. "
+        "Confirm the transaction in MetaMask when it opens."
+    )
     return ToolResult(
         ok=True,
-        data={"message": f"Opening rent payment for {prop['name']}.", "property_id": int(pid)},
-        actions=[
-            AgentAction(type="NAVIGATE", route="/tenant/rentals"),
-            AgentAction(type="OPEN_MODAL", modal="PAY_RENT", property_id=int(pid)),
-            # Auto-trigger the MetaMask transaction — the user only confirms in their wallet.
-            AgentAction(type="SUBMIT_FORM", modal="PAY_RENT", property_id=int(pid)),
-        ],
+        data={
+            "message": speak,
+            "property_id": pid,
+            "property_name": serialized["name"],
+            "monthly_rent_eth": serialized.get("monthly_rent_eth"),
+            "success_message": speak,
+            "speak_to_user": speak,
+        },
+        actions=_pay_rent_actions_on_submit(pid),
+    )
+
+
+async def _start_pay_rent_property(_args: dict, _user: AuthUser, _db: Any) -> ToolResult:
+    """Begin guided pay rent: collect property name, then open MetaMask."""
+    modal = _PAY_RENT_MODAL
+    session = _get_workflow_session(modal)
+    if session.get("submitted") or not session.get("filled"):
+        _clear_workflow_session(modal)
+        session = {}
+    filled = dict(session.get("filled") or {})
+    next_field = "property_name"
+    _set_workflow_session(
+        modal,
+        {
+            "in_progress": True,
+            "filled": filled,
+            "next_field": next_field,
+            "submitted": False,
+            "completing_submit": False,
+        },
+    )
+    instruction = (
+        f"Already collected: {', '.join(f'{k}={v}' for k, v in filled.items())}. "
+        f"Ask for {next_field} only — do NOT re-ask fields already in filled."
+        if filled
+        else "Ask: Which property would you like to pay rent for?"
+    )
+    return ToolResult(
+        ok=True,
+        data={
+            "workflow": "pay_rent",
+            "filled": filled,
+            "missing": [f for f in _PAY_RENT_REQUIRED if f not in filled or not filled.get(f)],
+            "next_field": next_field,
+            "instruction": instruction,
+        },
+        actions=[],
+    )
+
+
+async def _fill_pay_rent_property(args: dict, user: AuthUser, db: Any) -> ToolResult:
+    """Collect property name, sync rent chain, then auto-submit the pay-rent form."""
+    modal = _PAY_RENT_MODAL
+    tool_name = "fill_pay_rent_property"
+    accumulated = _recover_form_state(modal, tool_name, _PAY_RENT_FIELDS)
+
+    for field in _PAY_RENT_FIELDS:
+        value = args.get(field)
+        if value is None or value == "":
+            continue
+        accumulated[field] = str(value).strip()
+
+    accumulated = _merge_last_user_utterance(
+        accumulated, modal, _PAY_RENT_FIELDS, _PAY_RENT_REQUIRED
+    )
+
+    property_id: int | None = None
+    resolved_name: str | None = None
+    if accumulated.get("property_name"):
+        prop, err = _resolve_property_for_rent(db, accumulated["property_name"])
+        if err:
+            missing = [
+                f for f in _PAY_RENT_REQUIRED if f not in accumulated or not accumulated.get(f)
+            ]
+            return ToolResult(
+                ok=False,
+                error=err,
+                data={
+                    "filled": accumulated,
+                    "missing": missing,
+                    "next_field": "property_name",
+                    "submitted": False,
+                },
+            )
+        property_id = int(prop["id"])
+        resolved_name = str(prop.get("name") or accumulated["property_name"])
+        accumulated["property_id"] = str(property_id)
+        accumulated["property_name"] = resolved_name
+
+    missing = [f for f in _PAY_RENT_REQUIRED if f not in accumulated or not accumulated.get(f)]
+    submit = bool(args.get("submit"))
+    next_field = missing[0] if missing else None
+
+    if not submit and not missing and property_id is not None:
+        return await _fill_pay_rent_property({**args, "submit": True}, user, db)
+
+    instruction: str | None = None
+    if accumulated and next_field:
+        instruction = (
+            "Already collected: "
+            + ", ".join(f"{k}={v!r}" for k, v in accumulated.items())
+            + f". Ask the user for {next_field} next."
+        )
+    elif not missing:
+        instruction = (
+            "Property name collected. Call this tool again with submit=true "
+            "to open MetaMask for the user to confirm rent payment."
+        )
+
+    if submit and not missing and property_id is not None:
+        result = await _execute_pay_rent_ui(property_id, user, db)
+        if not result.ok:
+            return ToolResult(
+                ok=False,
+                error=result.error,
+                data={
+                    **(result.data or {}),
+                    "filled": accumulated,
+                    "missing": [],
+                    "submitted": False,
+                    "property_id": property_id,
+                    "property_name": resolved_name,
+                },
+            )
+        _set_workflow_session(
+            modal,
+            {
+                "in_progress": False,
+                "filled": accumulated,
+                "next_field": None,
+                "submitted": True,
+                "completing_submit": True,
+                "property_id": property_id,
+            },
+        )
+        payload = result.data or {}
+        speak = str(payload.get("speak_to_user") or payload.get("message") or "")
+        return ToolResult(
+            ok=True,
+            data={
+                "filled": accumulated,
+                "missing": [],
+                "submitted": True,
+                "property_id": property_id,
+                "property_name": resolved_name,
+                "success_message": speak,
+                "speak_to_user": speak,
+                "instruction": "Tell the user to confirm the transaction in MetaMask.",
+            },
+            actions=result.actions,
+        )
+
+    if submit and missing:
+        return ToolResult(
+            ok=False,
+            error=(
+                "Cannot submit yet. Still missing: "
+                + ", ".join(missing)
+                + f". Ask the user for {next_field} next."
+            ),
+            data={
+                "filled": accumulated,
+                "missing": missing,
+                "submitted": False,
+                "next_field": next_field,
+                "instruction": instruction,
+            },
+        )
+
+    _set_workflow_session(
+        modal,
+        {
+            "in_progress": True,
+            "filled": accumulated,
+            "next_field": next_field,
+            "submitted": False,
+            "completing_submit": False,
+            "property_id": property_id,
+        },
+    )
+    return ToolResult(
+        ok=True,
+        data={
+            "filled": accumulated,
+            "missing": missing,
+            "submitted": False,
+            "next_field": next_field,
+            "property_id": property_id,
+            "property_name": resolved_name,
+            "instruction": instruction,
+        },
+        actions=[],
     )
 
 
 register(ToolSpec(
-    name="start_pay_rent",
-    description="Open the pay-rent workflow on a specific property. The user confirms the transaction in MetaMask.",
+    name="start_pay_rent_property",
+    description=(
+        "Begin the guided pay-rent workflow. Ask which property to pay rent on, "
+        "then use fill_pay_rent_property for each user answer."
+    ),
+    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    roles=frozenset({"tenant"}),
+    handler=_start_pay_rent_property,
+))
+
+
+register(ToolSpec(
+    name="fill_pay_rent_property",
+    description=(
+        "Drive the guided pay-rent workflow after start_pay_rent_property. Pass only "
+        "new values each turn; the server merges prior turns. When property_name is "
+        "filled, call again with submit=true to sync rent on-chain and open MetaMask."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "property_id": {"type": "integer", "description": "ID of the property to pay rent on."},
+            "property_name": {
+                "type": "string",
+                "description": "Spoken property name, e.g. 'Oceanview Apartments'.",
+            },
+            "submit": {
+                "type": "boolean",
+                "description": (
+                    "Set true on the FINAL call once property_name is filled — "
+                    "syncs rent and triggers MetaMask."
+                ),
+            },
         },
-        "required": ["property_id"],
+        "additionalProperties": False,
+    },
+    roles=frozenset({"tenant"}),
+    handler=_fill_pay_rent_property,
+))
+
+
+async def _start_pay_rent(args: dict, user: AuthUser, db: Any) -> ToolResult:
+    """One-shot pay rent when property_id (or property_name) is already known."""
+    pid = args.get("property_id")
+    name = (args.get("property_name") or "").strip()
+    if not pid and not name:
+        return ToolResult(ok=False, error="property_id or property_name is required.")
+    if not pid:
+        prop, err = _resolve_property_for_rent(db, name)
+        if err:
+            return ToolResult(ok=False, error=err)
+        pid = int(prop["id"])
+    return await _execute_pay_rent_ui(int(pid), user, db)
+
+
+register(ToolSpec(
+    name="start_pay_rent",
+    description=(
+        "Open pay rent when you already know property_id or property_name. "
+        "Prefer start_pay_rent_property + fill_pay_rent_property for multi-turn chat."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "property_id": {
+                "type": "integer",
+                "description": "ID of the property to pay rent on.",
+            },
+            "property_name": {
+                "type": "string",
+                "description": "Spoken property name — resolved against rent-enabled listings.",
+            },
+        },
         "additionalProperties": False,
     },
     roles=frozenset({"tenant"}),
