@@ -27,7 +27,7 @@ def test_check_insufficient_funds_message(monkeypatch):
         lambda _p: 10**18,
     )
     monkeypatch.setattr(
-        "backend.services.investment_funding.get_native_balance",
+        "backend.services.wallet_funding.read_native_balance_wei",
         lambda _addr: 10**17,
     )
     out = check_investor_can_fund_investment(
@@ -46,7 +46,7 @@ def test_check_sufficient_funds(monkeypatch):
         lambda _p: 10**17,
     )
     monkeypatch.setattr(
-        "backend.services.investment_funding.get_native_balance",
+        "backend.services.wallet_funding.read_native_balance_wei",
         lambda _addr: 10**18,
     )
     out = check_investor_can_fund_investment(

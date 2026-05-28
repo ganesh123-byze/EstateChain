@@ -60,6 +60,10 @@ from backend.services.investment_funding import (
     InvestmentFundingError,
     check_investor_can_fund_investment,
 )
+from backend.services.rent_payment_funding import (
+    RentPaymentFundingError,
+    check_tenant_can_pay_monthly_rent,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -3296,6 +3300,36 @@ async def _execute_pay_rent_ui(property_id: int, user: AuthUser, db: Any) -> Too
                 ok=False,
                 error="Monthly rent on-chain is zero. The property owner must set rent first.",
                 data={"sync_failed": True},
+            )
+
+        try:
+            funding = check_tenant_can_pay_monthly_rent(
+                user.wallet_address or "",
+                rent_wei,
+                str(serialized.get("name") or ""),
+            )
+        except RentPaymentFundingError as exc:
+            return ToolResult(
+                ok=False,
+                error=str(exc),
+                data={"property_id": pid, "sync_failed": False},
+            )
+        if not funding.ok:
+            return ToolResult(
+                ok=True,
+                data={
+                    "insufficient_funds": True,
+                    "property_id": pid,
+                    "property_name": serialized["name"],
+                    "monthly_rent_eth": serialized.get("monthly_rent_eth"),
+                    "required_eth": funding.required_eth,
+                    "wallet_eth": funding.balance_eth,
+                    "shortfall_eth": funding.shortfall_eth,
+                    "speak_to_user": funding.speak_to_user,
+                    "instruction": funding.instruction,
+                    "submitted": False,
+                },
+                actions=[],
             )
     finally:
         cursor.close()

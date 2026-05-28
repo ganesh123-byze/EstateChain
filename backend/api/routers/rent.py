@@ -495,6 +495,17 @@ def prepare_rent_payment(
                 detail="Monthly rent on-chain is zero. Property owner must set rent first.",
             )
 
+        if effective_tenant_wallet:
+            from backend.services.rent_payment_funding import check_tenant_can_pay_monthly_rent
+
+            funding = check_tenant_can_pay_monthly_rent(
+                checksum,
+                rent_wei,
+                str(property_item.get("name") or ""),
+            )
+            if not funding.ok:
+                raise HTTPException(status_code=402, detail=funding.speak_to_user)
+
         calldata = encode_pay_rent(property_id)
         web3 = get_web3()
         now = datetime.utcnow()

@@ -11,10 +11,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from backend.services.blockchain import from_wei, get_contract, get_native_balance, get_web3
+from backend.services.blockchain import from_wei, get_contract, get_web3
+from backend.services.wallet_funding import (
+    WalletFundingError,
+    check_wallet_covers_required_wei,
+    format_eth_display,
+)
 
 
-class InvestmentFundingError(Exception):
+class InvestmentFundingError(WalletFundingError):
     """Raised when required investment cost cannot be determined."""
 
 
@@ -33,14 +38,6 @@ class InvestmentFundingCheck:
     token_amount: int
     speak_to_user: str = ""
     instruction: str = ""
-
-
-def _format_eth_display(wei: int) -> str:
-    eth = from_wei(max(0, int(wei)))
-    text = format(eth, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
 
 
 def read_sale_price_per_token_wei(property_item: dict[str, Any]) -> int:
@@ -90,49 +87,40 @@ def check_investor_can_fund_investment(
     token_amount: int,
 ) -> InvestmentFundingCheck:
     """Return whether ``wallet_address`` holds enough ETH for the order."""
-    web3 = get_web3()
-    if not wallet_address or not web3.is_address(wallet_address):
-        raise InvestmentFundingError("No valid wallet connected.")
-
     sale_price_per_token_wei = read_sale_price_per_token_wei(property_item)
     amount = int(token_amount)
     required_wei = sale_price_per_token_wei * amount
-    checksum = web3.to_checksum_address(wallet_address)
-    balance_wei = int(get_native_balance(checksum))
-    shortfall_wei = max(0, required_wei - balance_wei)
-    required_eth = _format_eth_display(required_wei)
-    balance_eth = _format_eth_display(balance_wei)
+    base = check_wallet_covers_required_wei(wallet_address, required_wei)
 
-    if balance_wei >= required_wei:
+    if base.ok:
         return InvestmentFundingCheck(
             ok=True,
-            required_wei=required_wei,
-            balance_wei=balance_wei,
-            required_eth=required_eth,
-            balance_eth=balance_eth,
+            required_wei=base.required_wei,
+            balance_wei=base.balance_wei,
+            required_eth=base.required_eth,
+            balance_eth=base.balance_eth,
             shortfall_wei=0,
             shortfall_eth="0",
             sale_price_per_token_wei=sale_price_per_token_wei,
             token_amount=amount,
         )
 
-    shortfall_eth = _format_eth_display(shortfall_wei)
     property_name = str(property_item.get("name") or "this property").strip()
     speak = (
         "You have insufficient funds in your account. "
-        f"Buying {int(token_amount)} token(s) in {property_name} requires "
-        f"{required_eth} ETH, but your wallet balance is {balance_eth} ETH "
-        f"(about {shortfall_eth} ETH short). "
+        f"Buying {amount} token(s) in {property_name} requires "
+        f"{base.required_eth} ETH, but your wallet balance is {base.balance_eth} ETH "
+        f"(about {base.shortfall_eth} ETH short). "
         "Add ETH to your wallet or reduce the number of tokens, then try again."
     )
     return InvestmentFundingCheck(
         ok=False,
-        required_wei=required_wei,
-        balance_wei=balance_wei,
-        required_eth=required_eth,
-        balance_eth=balance_eth,
-        shortfall_wei=shortfall_wei,
-        shortfall_eth=shortfall_eth,
+        required_wei=base.required_wei,
+        balance_wei=base.balance_wei,
+        required_eth=base.required_eth,
+        balance_eth=base.balance_eth,
+        shortfall_wei=base.shortfall_wei,
+        shortfall_eth=base.shortfall_eth,
         sale_price_per_token_wei=sale_price_per_token_wei,
         token_amount=amount,
         speak_to_user=speak,

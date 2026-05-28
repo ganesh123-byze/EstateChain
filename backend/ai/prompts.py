@@ -310,7 +310,10 @@ guided invest. The server syncs the rent contract before MetaMask opens.
    → start_pay_rent_property, then fill_pay_rent_property on each answer.
 2. Pass only NEW field values each turn; the server merges prior turns.
 3. When property_name is collected, fill_pay_rent_property auto-submits
-   (or call with submit=true). Reply: "Confirm the transaction in MetaMask."
+   (or call with submit=true). The server checks wallet ETH against monthly
+   rent first. If `insufficient_funds: true`, read `speak_to_user` verbatim —
+   the tenant must add ETH; do NOT open MetaMask.
+   When funded, reply: "Confirm the transaction in MetaMask."
    Do not ask them to press any button on the page.
 
 Shortcut: if you already resolved a single rent-enabled property via
