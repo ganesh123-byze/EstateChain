@@ -22,6 +22,13 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
 
+from backend.ai.investor_guards import (
+    claim_tool_blocked_message,
+    extract_last_human_utterance,
+    has_explicit_claim_intent,
+    has_explicit_invest_intent,
+    invest_tool_blocked_message,
+)
 from backend.ai.schemas import AgentAction, ToolResult
 from backend.api._helpers import (
     create_property_record,
@@ -2171,6 +2178,13 @@ register(ToolSpec(
 
 
 async def _start_invest(args: dict, _user: AuthUser, db: Any) -> ToolResult:
+    user_text = extract_last_human_utterance(_current_history())
+    if not has_explicit_invest_intent(user_text):
+        return ToolResult(
+            ok=False,
+            error=invest_tool_blocked_message(),
+            data={"blocked_wallet_ui": True, "modal": "INVEST_PROPERTY"},
+        )
     pid = args.get("property_id")
     token_amount = args.get("token_amount")
     if not pid:
@@ -2194,15 +2208,16 @@ async def _start_invest(args: dict, _user: AuthUser, db: Any) -> ToolResult:
             value=str(int(token_amount)),
             property_id=int(pid),
         ))
-        # Auto-trigger the MetaMask flow — the user only confirms in their wallet.
-        actions.append(AgentAction(
-            type="SUBMIT_FORM",
-            modal="INVEST_PROPERTY",
-            property_id=int(pid),
-        ))
     return ToolResult(
         ok=True,
-        data={"message": f"Opening invest dialog for {prop['name']}.", "property_id": int(pid)},
+        data={
+            "message": (
+                f"Opened the invest dialog for {prop['name']}. "
+                "The user must review the amount and tap Invest via MetaMask — "
+                "never auto-submit from chat."
+            ),
+            "property_id": int(pid),
+        },
         actions=actions,
     )
 
@@ -2210,9 +2225,11 @@ async def _start_invest(args: dict, _user: AuthUser, db: Any) -> ToolResult:
 register(ToolSpec(
     name="start_invest",
     description=(
-        "Open the invest workflow on a specific property. Optionally prefill the "
-        "token amount the user wants to buy. The user still confirms the "
-        "transaction in MetaMask."
+        "LAST RESORT — only after the user's latest message is an explicit order to "
+        "buy or invest in a named property (e.g. 'invest 10 tokens in Sunset Villas'). "
+        "Never use for marketplace browse, portfolio questions, comparisons, or "
+        "'how to invest'. Opens the invest dialog; user taps Invest via MetaMask "
+        "themselves. Does NOT submit or sign transactions."
     ),
     parameters={
         "type": "object",
@@ -2306,6 +2323,13 @@ register(ToolSpec(
 
 
 async def _start_claim_rewards(args: dict, _user: AuthUser, db: Any) -> ToolResult:
+    user_text = extract_last_human_utterance(_current_history())
+    if not has_explicit_claim_intent(user_text):
+        return ToolResult(
+            ok=False,
+            error=claim_tool_blocked_message(),
+            data={"blocked_wallet_ui": True, "modal": "CLAIM_REWARDS"},
+        )
     pid = args.get("property_id")
     if not pid:
         return ToolResult(ok=False, error="property_id is required.")
@@ -2318,19 +2342,28 @@ async def _start_claim_rewards(args: dict, _user: AuthUser, db: Any) -> ToolResu
         cursor.close()
     return ToolResult(
         ok=True,
-        data={"message": f"Opening rewards claim for {prop['name']}.", "property_id": int(pid)},
+        data={
+            "message": (
+                f"Opened the claim dialog for {prop['name']}. "
+                "The user must tap Claim via MetaMask when ready — never auto-submit from chat."
+            ),
+            "property_id": int(pid),
+        },
         actions=[
-            AgentAction(type="NAVIGATE", route="/investor/yield"),
+            AgentAction(type="NAVIGATE", route="/investor"),
             AgentAction(type="OPEN_MODAL", modal="CLAIM_REWARDS", property_id=int(pid)),
-            # Auto-trigger the MetaMask transaction — the user only confirms in their wallet.
-            AgentAction(type="SUBMIT_FORM", modal="CLAIM_REWARDS", property_id=int(pid)),
         ],
     )
 
 
 register(ToolSpec(
     name="start_claim_rewards",
-    description="Open the claim-rewards workflow for a specific property the investor holds tokens of.",
+    description=(
+        "LAST RESORT — only when the user's latest message explicitly orders a claim "
+        "(e.g. 'claim my rewards on Sunset Villas'). Never use for 'how much can I "
+        "claim', claimable totals, or claim history — use get_my_claimable_rewards or "
+        "get_my_claim_history instead. User confirms in the dialog via MetaMask."
+    ),
     parameters={
         "type": "object",
         "properties": {

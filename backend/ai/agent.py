@@ -25,6 +25,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from backend.ai.config import get_settings
+from backend.ai.investor_guards import sanitize_investor_wallet_actions
 from backend.ai.prompts import system_prompt_for_role
 from backend.ai.schemas import AgentAction, ChatMessage, ChatResponse, InterruptResponse
 from backend.ai.tools import (
@@ -207,6 +208,16 @@ async def _call_tools(state: AgentState, user: AuthUser, db: Any) -> dict:
                 )
     finally:
         reset_current_messages(ctx_token)
+
+    role = canonical_role(user.role)
+    if role == "investor" and actions:
+        before = len(actions)
+        actions = sanitize_investor_wallet_actions(messages, actions)
+        if len(actions) < before:
+            LOGGER.info(
+                "[_call_tools] Stripped %d investor wallet UI action(s) — no explicit buy/claim intent",
+                before - len(actions),
+            )
 
     LOGGER.info("[_call_tools] Total actions accumulated: %d", len(actions))
     return {"actions": actions, "messages": messages + tool_results}

@@ -109,6 +109,10 @@ function MarketplaceCard({ property, wallet }: { property: Property; wallet: str
           setDetailOpen(false);
           setInvestOpen(true);
         }}
+        investTriggerProps={{
+          "data-workflow-modal-trigger": "INVEST_PROPERTY",
+          "data-workflow-property-id": String(property.id),
+        }}
       />
 
       <PropertyDetailDialog

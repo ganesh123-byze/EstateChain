@@ -99,18 +99,8 @@ export function InvestorClaimDialog({
     return subscribeWorkflowAction((action) => {
       if (!isWorkflowModalAction(action, "CLAIM_REWARDS")) return;
       if (action.property_id !== undefined && !workflowPropertyMatches(action, reward?.property_id ?? "")) return;
-      if (action.type === "SUBMIT_FORM") {
-        const tryClaim = (attemptsLeft: number) => {
-          window.setTimeout(() => {
-            if (open) {
-              void onClaim();
-              return;
-            }
-            if (attemptsLeft > 0) tryClaim(attemptsLeft - 1);
-          }, 180);
-        };
-        tryClaim(24);
-      }
+      // Investor copilot never auto-submits — user taps Claim via MetaMask.
+      if (action.type === "SUBMIT_FORM") return;
     });
   }, [onClaim, open, reward?.property_id]);
 

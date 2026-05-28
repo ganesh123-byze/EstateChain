@@ -1,8 +1,12 @@
 "use client";
 
 import type { AIAction } from "./types";
+import { getRoleFromPath, type RoleKey } from "./quick-actions";
 
 const delay = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+/** Investor copilot must never auto-submit on-chain dialogs from chat. */
+const INVESTOR_NO_AUTO_SUBMIT_MODALS = new Set(["INVEST_PROPERTY", "CLAIM_REWARDS"]);
 
 const MODAL_RETRIES = 6;
 const MODAL_RETRY_DELAY = 220;
@@ -173,13 +177,45 @@ async function waitForModalField(modal: string, timeoutMs = 5000) {
  * on every FILL_FIELD action coming in from the AI. We now only wait when
  * we actually clicked something.
  */
-async function openWorkflowModal(modal: string): Promise<boolean> {
+function workflowTriggerSelector(modal: string, propertyId?: number | string) {
+  const base = `[data-workflow-modal-trigger="${modal}"]`;
+  if (propertyId === undefined || propertyId === null || propertyId === "") return base;
+  return `${base}[data-workflow-property-id="${propertyId}"]`;
+}
+
+async function openWorkflowModal(modal: string, propertyId?: number | string): Promise<boolean> {
   if (typeof document === "undefined") return false;
   if (document.querySelector(`[data-workflow-field^="${modal}."]`)) return true;
-  const trigger = document.querySelector<HTMLButtonElement>(`[data-workflow-modal-trigger="${modal}"]`);
+
+  const scoped =
+    propertyId !== undefined && propertyId !== null && propertyId !== ""
+      ? document.querySelector<HTMLButtonElement>(workflowTriggerSelector(modal, propertyId))
+      : null;
+  const trigger =
+    scoped ??
+    document.querySelector<HTMLButtonElement>(`[data-workflow-modal-trigger="${modal}"]`);
   if (!trigger) return false;
   trigger.click();
   await waitForModalField(modal, 3000);
+  return Boolean(document.querySelector(`[data-workflow-field^="${modal}."]`));
+}
+
+async function waitForWorkflowModalReady(
+  modal: string,
+  propertyId?: number | string,
+  timeoutMs = 6000,
+) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (document.querySelector(`[data-workflow-field^="${modal}."]`)) return true;
+    await delay(120);
+    if (propertyId !== undefined && propertyId !== null && propertyId !== "") {
+      const trigger = document.querySelector<HTMLButtonElement>(
+        workflowTriggerSelector(modal, propertyId),
+      );
+      trigger?.click();
+    }
+  }
   return Boolean(document.querySelector(`[data-workflow-field^="${modal}."]`));
 }
 
@@ -202,9 +238,12 @@ function setWorkflowInputValue(modal: string, field: string, value: string) {
  * form's normal onSubmit handler runs — same code path a human user takes
  * when they tap "Create" themselves.
  */
-async function clickWorkflowSubmitVisibly(modal: string): Promise<boolean> {
+async function clickWorkflowSubmitVisibly(
+  modal: string,
+  propertyId?: number | string,
+): Promise<boolean> {
   if (typeof document === "undefined") return false;
-  const opened = await openWorkflowModal(modal);
+  const opened = await openWorkflowModal(modal, propertyId);
   if (!opened) {
     console.info(
       "[AI Action] Workflow form not on this page; cannot submit:",
@@ -249,6 +288,22 @@ async function clickWorkflowSubmitVisibly(modal: string): Promise<boolean> {
   return true;
 }
 
+export function roleFromBrowserPath(): RoleKey | null {
+  if (typeof window === "undefined") return null;
+  return getRoleFromPath(window.location.pathname);
+}
+
+/**
+ * Strip investor on-chain auto-submits. Manual Invest / Claim buttons are unchanged.
+ */
+export function sanitizeActionsForRole(role: RoleKey | null, actions: AIAction[]): AIAction[] {
+  if (role !== "investor") return actions;
+  return actions.filter((action) => {
+    if (action.type !== "SUBMIT_FORM" || !action.modal) return true;
+    return !INVESTOR_NO_AUTO_SUBMIT_MODALS.has(action.modal);
+  });
+}
+
 /** Execute a single UI action. */
 export async function executeAction(action: AIAction, router: { push: (href: string) => void }) {
   console.log("[AI Action] Executing:", action.type, action);
@@ -260,10 +315,10 @@ export async function executeAction(action: AIAction, router: { push: (href: str
     return;
   }
   if (action.type === "OPEN_MODAL" && action.modal) {
-    console.log("[AI Action] Opening modal:", action.modal);
+    console.log("[AI Action] Opening modal:", action.modal, action.property_id);
     workflowFormValues.delete(action.modal);
     clearPendingModalActions(action.modal);
-    const opened = await openWorkflowModal(action.modal);
+    const opened = await openWorkflowModal(action.modal, action.property_id ?? undefined);
     // Always emit the OPEN_MODAL event so listeners that mount later (after
     // a navigation) can pick it up via takePendingModalOpen.
     for (let i = 0; i < MODAL_RETRIES; i++) {
@@ -296,7 +351,7 @@ export async function executeAction(action: AIAction, router: { push: (href: str
     workflowFormValues.set(action.modal, values);
     // Try to fill the live input if the modal is reachable from the
     // current page; otherwise emit-only so navigation-on-mount works.
-    const opened = await openWorkflowModal(action.modal);
+    const opened = await openWorkflowModal(action.modal, action.property_id ?? undefined);
     if (opened) {
       await waitForModalField(action.modal);
       setWorkflowInputValue(action.modal, action.field, String(action.value ?? ""));
@@ -307,7 +362,11 @@ export async function executeAction(action: AIAction, router: { push: (href: str
   }
   if (action.type === "SUBMIT_FORM" && action.modal) {
     console.log("[AI Action] Submitting form (visible click):", action.modal);
-    const clicked = await clickWorkflowSubmitVisibly(action.modal);
+    await waitForWorkflowModalReady(action.modal, action.property_id ?? undefined);
+    const clicked = await clickWorkflowSubmitVisibly(
+      action.modal,
+      action.property_id ?? undefined,
+    );
     // Emit the action AFTER the click so any listener that wants to react
     // to "the agent just hit submit" can do so without colliding with the
     // form's own onSubmit handler.
@@ -324,8 +383,14 @@ export async function executeAction(action: AIAction, router: { push: (href: str
   console.log("[AI Action] Unknown action type or missing fields:", action);
 }
 
-export async function executeActions(actions: AIAction[], router: { push: (href: string) => void }) {
-  for (const action of actions) {
+export async function executeActions(
+  actions: AIAction[],
+  router: { push: (href: string) => void },
+  opts?: { role?: RoleKey | null },
+) {
+  const role = opts?.role ?? roleFromBrowserPath();
+  const safe = sanitizeActionsForRole(role, actions);
+  for (const action of safe) {
     await executeAction(action, router);
   }
 }

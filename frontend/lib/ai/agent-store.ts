@@ -3,7 +3,12 @@
 import { create } from "zustand";
 import { getApiBase, getToken } from "@/lib/api";
 import { RUNTIME_CONFIG } from "@/lib/runtime-config";
-import { executeActions, subscribeCompletion, type AICompletionEvent } from "./action-executor";
+import {
+  executeActions,
+  roleFromBrowserPath,
+  subscribeCompletion,
+  type AICompletionEvent,
+} from "./action-executor";
 import {
   cancelRecording,
   onSpeakingChange,
@@ -23,7 +28,7 @@ const ROLE_WELCOME: Record<RoleKey, string> = {
   property_owner:
     "Hi, I'm your Property Owner Copilot. I can list a new property, edit or remove an existing one, set rent, and answer anything about your portfolio, investors, or rent collections. What would you like to do?",
   investor:
-    "Hi, I'm your Investor Copilot. I can browse the marketplace, invest in a property, claim yield, or walk you through your portfolio and recent transactions. What would you like to do?",
+    "Hi, I'm your Investor Copilot. I can browse the marketplace, summarize your portfolio and yield, and open the invest or claim dialogs when you ask — you'll confirm any transaction in MetaMask yourself. What would you like to know?",
   tenant:
     "Hi, I'm your Tenant Copilot. I can pay this month's rent, show your rent history, and tell you when your next payment is due. What would you like to do?",
 };
@@ -252,7 +257,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       if (streamError) throw new Error(streamError);
 
       if (actions.length) {
-        await executeActions(actions, router);
+        await executeActions(actions, router, { role: roleFromBrowserPath() });
         if (typeof window !== "undefined") {
           window.dispatchEvent(new CustomEvent("estatechain:ai-data-changed"));
         }
@@ -334,7 +339,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       onActions: (actions) => {
         set({ actions: actions as AIAction[] });
         if (actions?.length) {
-          executeActions(actions as AIAction[], router);
+          executeActions(actions as AIAction[], router, { role });
           if (typeof window !== "undefined") {
             window.dispatchEvent(new CustomEvent("estatechain:ai-data-changed"));
           }

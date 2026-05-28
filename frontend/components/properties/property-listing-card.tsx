@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import type { ButtonHTMLAttributes, ReactNode } from "react";
 import { MapPin } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -19,6 +19,8 @@ export type PropertyListingCardProps = {
   onActionClick?: (e: React.MouseEvent) => void;
   actionDisabled?: boolean;
   actionVariant?: "default" | "secondary";
+  /** Passed to the primary action button (e.g. AI workflow modal triggers). */
+  investTriggerProps?: ButtonHTMLAttributes<HTMLButtonElement>;
   footerExtra?: ReactNode;
   toolbar?: ReactNode;
   className?: string;
@@ -34,6 +36,7 @@ export function PropertyListingCard({
   onActionClick,
   actionDisabled,
   actionVariant = "default",
+  investTriggerProps,
   footerExtra,
   toolbar,
   className,
@@ -128,6 +131,7 @@ export function PropertyListingCard({
             variant={actionVariant}
             className="h-8 shrink-0 gap-1.5 rounded-lg px-3 text-xs font-semibold shadow-sm"
             disabled={actionDisabled}
+            {...investTriggerProps}
             onClick={(e) => {
               e.stopPropagation();
               onActionClick?.(e);

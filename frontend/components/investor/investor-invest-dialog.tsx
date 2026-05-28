@@ -102,18 +102,8 @@ export function InvestorInvestDialog({
         window.setTimeout(() => focusWorkflowField("INVEST_PROPERTY", action.field!), 80);
         return;
       }
-      if (action.type === "SUBMIT_FORM") {
-        const trySubmit = (attemptsLeft: number) => {
-          window.setTimeout(() => {
-            if (formRef.current) {
-              formRef.current.requestSubmit();
-              return;
-            }
-            if (attemptsLeft > 0) trySubmit(attemptsLeft - 1);
-          }, 180);
-        };
-        trySubmit(24);
-      }
+      // Investor copilot never auto-submits — user taps Invest via MetaMask.
+      if (action.type === "SUBMIT_FORM") return;
     });
   }, [property.id]);
 
@@ -130,7 +120,12 @@ export function InvestorInvestDialog({
             Buy ownership tokens directly from the property SecurityToken contract.
           </DialogDescription>
         </DialogHeader>
-        <form ref={formRef} onSubmit={onSubmit} className="space-y-4">
+        <form
+          ref={formRef}
+          data-workflow-form="INVEST_PROPERTY"
+          onSubmit={onSubmit}
+          className="space-y-4"
+        >
           <div className="grid gap-1.5">
             <Label>Token amount</Label>
             <Input

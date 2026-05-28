@@ -11,7 +11,7 @@ const INVESTOR_ACTIONS: QuickAction[] = [
   {
     id: "investor.marketplace",
     label: "Browse marketplace",
-    prompt: "Take me to the marketplace and show me available properties to invest in.",
+    prompt: "Take me to the marketplace and summarize the properties available for sale.",
     icon: "Store",
   },
   {
