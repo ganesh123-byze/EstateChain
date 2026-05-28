@@ -28,6 +28,7 @@ from backend.ai.investor_guards import (
     has_explicit_claim_intent,
     has_explicit_invest_intent,
     invest_tool_blocked_message,
+    wants_to_begin_invest_workflow,
 )
 from backend.ai.schemas import AgentAction, ToolResult
 from backend.api._helpers import (
@@ -2177,59 +2178,369 @@ register(ToolSpec(
 ))
 
 
+_INVEST_MODAL = "INVEST_PROPERTY"
+_INVEST_FIELDS = ("property_name", "token_amount")
+_INVEST_REQUIRED = ("property_name", "token_amount")
+
+
+def invest_workflow_session() -> dict:
+    """Current guided-invest session for this thread (used by agent guards)."""
+    return _get_workflow_session(_INVEST_MODAL)
+
+
+def _validate_property_investable(prop: dict) -> str | None:
+    if not prop.get("token_address"):
+        name = prop.get("name") or "This property"
+        return f"{name} is not open for investment yet — no token contract is deployed."
+    try:
+        available = int(str(prop.get("tokens_available") or "0"))
+    except (TypeError, ValueError):
+        available = 0
+    if available <= 0:
+        name = prop.get("name") or "This property"
+        return f"{name} has no tokens available for sale right now."
+    return None
+
+
+def _resolve_property_by_name(db: Any, name: str) -> tuple[dict | None, str | None]:
+    """Fuzzy-match a spoken property name to a single investable listing."""
+    query = (name or "").strip()
+    if not query:
+        return None, "Property name is required."
+    cursor = db.cursor(dictionary=True)
+    try:
+        items = _list_properties(cursor)
+    finally:
+        cursor.close()
+    matches = _filter_properties_by_fuzzy_search(items, query)
+    if not matches:
+        return None, (
+            f"No property found matching {query!r}. Ask the user for the exact "
+            "property name or call list_properties to suggest options."
+        )
+    if len(matches) > 1:
+        top, second = matches[0], matches[1]
+        gap = _property_match_score(query, top) - _property_match_score(query, second)
+        if gap < 0.08:
+            names = ", ".join(p.get("name") or f"#{p.get('id')}" for p in matches[:3])
+            return None, (
+                f"Several properties match {query!r}: {names}. "
+                "Ask which one the user means."
+            )
+    prop = matches[0]
+    err = _validate_property_investable(prop)
+    if err:
+        return None, err
+    return prop, None
+
+
+def _invest_actions_on_submit(property_id: int, token_amount: str) -> list[AgentAction]:
+    """Navigate, open dialog, fill amount, and click Invest (MetaMask confirm is manual)."""
+    pid = int(property_id)
+    amount = str(int(token_amount))
+    return [
+        AgentAction(type="NAVIGATE", route="/investor/marketplace"),
+        AgentAction(type="OPEN_MODAL", modal=_INVEST_MODAL, property_id=pid),
+        AgentAction(
+            type="FILL_FIELD",
+            modal=_INVEST_MODAL,
+            field="token_amount",
+            value=amount,
+            property_id=pid,
+        ),
+        AgentAction(type="SUBMIT_FORM", modal=_INVEST_MODAL, property_id=pid),
+    ]
+
+
+async def _start_invest_property(_args: dict, _user: AuthUser, _db: Any) -> ToolResult:
+    """Begin guided invest: ask property name first, then token amount."""
+    user_text = extract_last_human_utterance(_current_history())
+    if not (has_explicit_invest_intent(user_text) or wants_to_begin_invest_workflow(user_text)):
+        return ToolResult(
+            ok=False,
+            error=invest_tool_blocked_message(),
+            data={"blocked_wallet_ui": True, "modal": _INVEST_MODAL},
+        )
+
+    modal = _INVEST_MODAL
+    session = _get_workflow_session(modal)
+    if session.get("submitted") or not session.get("filled"):
+        _clear_workflow_session(modal)
+        session = {}
+    filled = dict(session.get("filled") or {})
+    missing = [f for f in _INVEST_REQUIRED if f not in filled or not filled.get(f)]
+    next_field = missing[0] if missing else "property_name"
+    _set_workflow_session(
+        modal,
+        {
+            "in_progress": True,
+            "filled": filled,
+            "next_field": next_field,
+            "submitted": False,
+            "completing_submit": False,
+        },
+    )
+    instruction = (
+        f"Already collected: {', '.join(f'{k}={v}' for k, v in filled.items())}. "
+        f"Ask for {next_field} only — do NOT re-ask fields already in filled."
+        if filled
+        else "Ask: Which property would you like to invest in? (property name)"
+    )
+    return ToolResult(
+        ok=True,
+        data={
+            "message": "Starting guided investment.",
+            "filled": filled,
+            "missing": missing,
+            "next_field": next_field,
+            "instruction": instruction,
+        },
+        actions=[AgentAction(type="NAVIGATE", route="/investor/marketplace")],
+    )
+
+
+register(ToolSpec(
+    name="start_invest_property",
+    description=(
+        "MANDATORY first step when the user wants to invest / buy tokens but has not "
+        "finished the guided form. Opens the marketplace and asks which property they "
+        "want (property name first, then token amount via fill_invest_property). Call "
+        "this when they say 'I want to invest' even if they did not name a property yet."
+    ),
+    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    roles=frozenset({"investor"}),
+    handler=_start_invest_property,
+))
+
+
+async def _fill_invest_property(args: dict, _user: AuthUser, db: Any) -> ToolResult:
+    """Collect property name + token amount, then auto-fill and submit the invest form."""
+    modal = _INVEST_MODAL
+    tool_name = "fill_invest_property"
+    accumulated = _recover_form_state(modal, tool_name, _INVEST_FIELDS)
+
+    for field in _INVEST_FIELDS:
+        value = args.get(field)
+        if value is None or value == "":
+            continue
+        accumulated[field] = str(value).strip()
+
+    accumulated = _merge_last_user_utterance(
+        accumulated, modal, _INVEST_FIELDS, _INVEST_REQUIRED
+    )
+
+    property_id: int | None = None
+    resolved_name: str | None = None
+    if accumulated.get("property_name"):
+        prop, err = _resolve_property_by_name(db, accumulated["property_name"])
+        if err:
+            missing = [f for f in _INVEST_REQUIRED if f not in accumulated or not accumulated.get(f)]
+            return ToolResult(
+                ok=False,
+                error=err,
+                data={
+                    "filled": accumulated,
+                    "missing": missing,
+                    "next_field": "property_name",
+                    "submitted": False,
+                },
+            )
+        property_id = int(prop["id"])
+        resolved_name = str(prop.get("name") or accumulated["property_name"])
+        accumulated["property_id"] = str(property_id)
+        accumulated["property_name"] = resolved_name
+
+    missing = [f for f in _INVEST_REQUIRED if f not in accumulated or not accumulated.get(f)]
+    submit = bool(args.get("submit"))
+    next_field = missing[0] if missing else None
+    instruction: str | None = None
+    if accumulated and next_field:
+        instruction = (
+            "Already collected: "
+            + ", ".join(f"{k}={v!r}" for k, v in accumulated.items())
+            + f". Ask the user for {next_field} next. "
+            "Do NOT re-ask for any field already in filled."
+        )
+    elif not missing:
+        instruction = (
+            "All required fields are collected. Call this tool again with submit=true "
+            "to fill the invest form and open MetaMask for the user to confirm."
+        )
+
+    if submit and not missing and property_id is not None:
+        try:
+            token_amount = int(accumulated["token_amount"])
+        except (TypeError, ValueError):
+            return ToolResult(
+                ok=False,
+                error="token_amount must be a whole number of tokens.",
+                data={"filled": accumulated, "missing": ["token_amount"], "next_field": "token_amount"},
+            )
+        if token_amount < 1:
+            return ToolResult(
+                ok=False,
+                error="token_amount must be at least 1.",
+                data={"filled": accumulated, "missing": ["token_amount"], "next_field": "token_amount"},
+            )
+
+        _set_workflow_session(
+            modal,
+            {
+                "in_progress": False,
+                "filled": accumulated,
+                "next_field": None,
+                "submitted": True,
+                "completing_submit": True,
+                "property_id": property_id,
+            },
+        )
+        speak = (
+            f"I've filled your investment in {resolved_name} for {token_amount} tokens. "
+            "Confirm the payment in MetaMask when it opens."
+        )
+        actions = _invest_actions_on_submit(property_id, str(token_amount))
+        return ToolResult(
+            ok=True,
+            data={
+                "filled": accumulated,
+                "missing": [],
+                "submitted": True,
+                "property_id": property_id,
+                "property_name": resolved_name,
+                "token_amount": token_amount,
+                "success_message": speak,
+                "speak_to_user": speak,
+                "instruction": "Tell the user to confirm the transaction in MetaMask.",
+            },
+            actions=actions,
+        )
+
+    if submit and missing:
+        return ToolResult(
+            ok=False,
+            error=(
+                "Cannot submit yet. Still missing: "
+                + ", ".join(missing)
+                + f". Ask the user for {next_field} next."
+            ),
+            data={
+                "filled": accumulated,
+                "missing": missing,
+                "submitted": False,
+                "next_field": next_field,
+                "instruction": instruction,
+            },
+        )
+
+    _set_workflow_session(
+        modal,
+        {
+            "in_progress": True,
+            "filled": accumulated,
+            "next_field": next_field,
+            "submitted": False,
+            "completing_submit": False,
+            "property_id": property_id,
+        },
+    )
+    return ToolResult(
+        ok=True,
+        data={
+            "filled": accumulated,
+            "missing": missing,
+            "submitted": False,
+            "next_field": next_field,
+            "property_id": property_id,
+            "property_name": resolved_name,
+            "instruction": instruction,
+        },
+        actions=[],
+    )
+
+
+register(ToolSpec(
+    name="fill_invest_property",
+    description=(
+        "Drive the guided invest workflow. Call after start_invest_property whenever "
+        "the user answers a field — pass only NEW values; the server merges prior turns. "
+        "Field order: property_name first, then token_amount. Result includes filled, "
+        "missing, and next_field. When missing is empty, call again with submit=true "
+        "to auto-fill the form and open MetaMask (user taps Confirm in the wallet)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "property_name": {
+                "type": "string",
+                "description": "Spoken property name, e.g. 'Sunset Villas' or 'ocean view'.",
+            },
+            "token_amount": {
+                "type": "string",
+                "description": "Whole number of tokens to buy, e.g. '10'.",
+            },
+            "submit": {
+                "type": "boolean",
+                "description": (
+                    "Set true on the FINAL call once property_name and token_amount are "
+                    "filled — auto-fills the invest dialog and triggers MetaMask."
+                ),
+            },
+        },
+        "additionalProperties": False,
+    },
+    roles=frozenset({"investor"}),
+    handler=_fill_invest_property,
+))
+
+
 async def _start_invest(args: dict, _user: AuthUser, db: Any) -> ToolResult:
+    """Legacy one-shot entry — prefer start_invest_property + fill_invest_property."""
     user_text = extract_last_human_utterance(_current_history())
     if not has_explicit_invest_intent(user_text):
         return ToolResult(
             ok=False,
             error=invest_tool_blocked_message(),
-            data={"blocked_wallet_ui": True, "modal": "INVEST_PROPERTY"},
+            data={"blocked_wallet_ui": True, "modal": _INVEST_MODAL},
         )
     pid = args.get("property_id")
     token_amount = args.get("token_amount")
     if not pid:
-        return ToolResult(ok=False, error="property_id is required.")
+        return await _start_invest_property({}, _user, db)
+
     cursor = db.cursor(dictionary=True)
     try:
-        prop = fetch_property(cursor, int(pid))
-        if not prop:
+        row = fetch_property(cursor, int(pid))
+        if not row:
             return ToolResult(ok=False, error=f"Property {pid} not found.")
+        prop = _serialize_property(enrich_property_with_supply(cursor, row))
+        err = _validate_property_investable(prop)
     finally:
         cursor.close()
-    actions: list[AgentAction] = [
-        AgentAction(type="NAVIGATE", route="/investor/marketplace"),
-        AgentAction(type="OPEN_MODAL", modal="INVEST_PROPERTY", property_id=int(pid)),
-    ]
-    if token_amount is not None:
-        actions.append(AgentAction(
-            type="FILL_FIELD",
-            modal="INVEST_PROPERTY",
-            field="token_amount",
-            value=str(int(token_amount)),
-            property_id=int(pid),
-        ))
-    return ToolResult(
-        ok=True,
-        data={
-            "message": (
-                f"Opened the invest dialog for {prop['name']}. "
-                "The user must review the amount and tap Invest via MetaMask — "
-                "never auto-submit from chat."
-            ),
-            "property_id": int(pid),
+    if err:
+        return ToolResult(ok=False, error=err)
+
+    if token_amount is None:
+        return await _fill_invest_property(
+            {"property_name": str(prop.get("name") or "")},
+            _user,
+            db,
+        )
+    return await _fill_invest_property(
+        {
+            "property_name": str(prop.get("name") or ""),
+            "token_amount": str(int(token_amount)),
+            "submit": True,
         },
-        actions=actions,
+        _user,
+        db,
     )
 
 
 register(ToolSpec(
     name="start_invest",
     description=(
-        "LAST RESORT — only after the user's latest message is an explicit order to "
-        "buy or invest in a named property (e.g. 'invest 10 tokens in Sunset Villas'). "
-        "Never use for marketplace browse, portfolio questions, comparisons, or "
-        "'how to invest'. Opens the invest dialog; user taps Invest via MetaMask "
-        "themselves. Does NOT submit or sign transactions."
+        "Prefer start_invest_property + fill_invest_property for the guided flow. "
+        "One-shot shortcut only when you already have property_id and token_amount."
     ),
     parameters={
         "type": "object",
@@ -2237,7 +2548,6 @@ register(ToolSpec(
             "property_id": {"type": "integer", "description": "ID of the property to invest in."},
             "token_amount": {"type": "integer", "minimum": 1, "description": "Number of whole tokens to purchase."},
         },
-        "required": ["property_id"],
         "additionalProperties": False,
     },
     roles=frozenset({"investor"}),

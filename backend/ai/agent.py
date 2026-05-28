@@ -30,6 +30,7 @@ from backend.ai.prompts import system_prompt_for_role
 from backend.ai.schemas import AgentAction, ChatMessage, ChatResponse, InterruptResponse
 from backend.ai.tools import (
     dispatch,
+    invest_workflow_session,
     openai_tool_schemas,
     reset_current_messages,
     reset_current_thread_id,
@@ -212,7 +213,9 @@ async def _call_tools(state: AgentState, user: AuthUser, db: Any) -> dict:
     role = canonical_role(user.role)
     if role == "investor" and actions:
         before = len(actions)
-        actions = sanitize_investor_wallet_actions(messages, actions)
+        actions = sanitize_investor_wallet_actions(
+            messages, actions, invest_session=invest_workflow_session()
+        )
         if len(actions) < before:
             LOGGER.info(
                 "[_call_tools] Stripped %d investor wallet UI action(s) — no explicit buy/claim intent",

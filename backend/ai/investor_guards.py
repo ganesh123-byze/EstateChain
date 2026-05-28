@@ -60,6 +60,20 @@ _CLAIM_TRANSACTIONAL = re.compile(
     re.IGNORECASE,
 )
 
+# User wants to start a guided invest flow (property name first, then amount).
+_BEGIN_INVEST_WORKFLOW = re.compile(
+    r"\b("
+    r"i\s+want\s+to\s+invest|"
+    r"help\s+me\s+invest|"
+    r"let(?:'s|\s+us)\s+invest\b|"
+    r"start\s+(?:an?\s+)?invest(?:ment|ing)?|"
+    r"make\s+(?:an?\s+)?investment|"
+    r"i(?:'d|\s+would)\s+like\s+to\s+invest\b|"
+    r"ready\s+to\s+invest"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # Soft "invest" mentions that are research, not orders.
 _INVEST_RESEARCH = re.compile(
     r"\b("
@@ -105,22 +119,51 @@ def extract_last_human_utterance(messages: list[Any] | None) -> str:
     return _normalize_text(content if isinstance(content, str) else "")
 
 
+def wants_to_begin_invest_workflow(text: str) -> bool:
+    """True when the user asks to invest but has not necessarily named a property yet."""
+    t = _normalize_text(text)
+    if not t or _INVEST_RESEARCH.search(t):
+        return False
+    if _BEGIN_INVEST_WORKFLOW.search(t):
+        return True
+    return False
+
+
 def has_explicit_invest_intent(text: str) -> bool:
-    """True only when the user is ordering a buy/invest, not researching."""
+    """True when the user is ordering a buy/invest, not researching."""
     t = _normalize_text(text)
     if not t:
         return False
     if _INVEST_RESEARCH.search(t):
         return False
-    if not _INVEST_TRANSACTIONAL.search(t):
+    if _INVEST_TRANSACTIONAL.search(t):
+        if _INFO_OR_BROWSE.search(t) and not re.search(
+            r"\b(?:buy|purchase)\s+\d+|invest\s+\d+\s+tokens?",
+            t,
+            re.IGNORECASE,
+        ):
+            return False
+        return True
+    return wants_to_begin_invest_workflow(t)
+
+
+def invest_workflow_active(session: dict | None) -> bool:
+    """True while a guided invest form is being collected or submitted."""
+    if not session:
         return False
-    if _INFO_OR_BROWSE.search(t) and not re.search(
-        r"\b(?:buy|purchase)\s+\d+|invest\s+\d+\s+tokens?",
-        t,
-        re.IGNORECASE,
-    ):
-        return False
-    return True
+    if session.get("completing_submit"):
+        return True
+    return bool(session.get("in_progress")) and not session.get("submitted")
+
+
+def investor_invest_wallet_permitted(
+    user_text: str,
+    invest_session: dict | None = None,
+) -> bool:
+    """Whether invest modal / MetaMask submit actions may be emitted this turn."""
+    if invest_workflow_active(invest_session):
+        return True
+    return has_explicit_invest_intent(user_text)
 
 
 def has_explicit_claim_intent(text: str) -> bool:
@@ -133,9 +176,9 @@ def has_explicit_claim_intent(text: str) -> bool:
     return False
 
 
-def wallet_ui_allowed(modal: str, user_text: str) -> bool:
+def wallet_ui_allowed(modal: str, user_text: str, *, invest_session: dict | None = None) -> bool:
     if modal == "INVEST_PROPERTY":
-        return has_explicit_invest_intent(user_text)
+        return investor_invest_wallet_permitted(user_text, invest_session)
     if modal == "CLAIM_REWARDS":
         return has_explicit_claim_intent(user_text)
     return True
@@ -144,15 +187,16 @@ def wallet_ui_allowed(modal: str, user_text: str) -> bool:
 def sanitize_investor_wallet_actions(
     messages: list[Any] | None,
     actions: list[AgentAction],
+    *,
+    invest_session: dict | None = None,
 ) -> list[AgentAction]:
-    """Drop invest/claim modal actions unless the latest user message requests them."""
+    """Drop invest/claim modal actions unless permitted for this turn."""
     if not actions:
         return actions
     user_text = extract_last_human_utterance(messages)
-    invest_ok = has_explicit_invest_intent(user_text)
+    invest_ok = investor_invest_wallet_permitted(user_text, invest_session)
     claim_ok = has_explicit_claim_intent(user_text)
-    if invest_ok and claim_ok:
-        pass  # rare; keep both filters per-action below
+    completing = bool((invest_session or {}).get("completing_submit"))
 
     filtered: list[AgentAction] = []
     for action in actions:
@@ -162,7 +206,13 @@ def sanitize_investor_wallet_actions(
                 continue
             if modal == "CLAIM_REWARDS" and not claim_ok:
                 continue
-        if action.type == "SUBMIT_FORM" and modal in _INVESTOR_WALLET_MODALS:
+        if (
+            action.type == "SUBMIT_FORM"
+            and modal == "INVEST_PROPERTY"
+            and not (invest_ok and completing)
+        ):
+            continue
+        if action.type == "SUBMIT_FORM" and modal == "CLAIM_REWARDS" and not claim_ok:
             continue
         filtered.append(action)
     return filtered
