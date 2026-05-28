@@ -56,6 +56,10 @@ from backend.api.rent_cycle import (
     get_last_confirmed_rent_payment_by_wallet,
 )
 from backend.services.auth import AuthUser, canonical_role, normalize_address
+from backend.services.investment_funding import (
+    InvestmentFundingError,
+    check_investor_can_fund_investment,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -2704,6 +2708,74 @@ def _invest_actions_on_submit(property_id: int, token_amount: str) -> list[Agent
     ]
 
 
+def _load_invest_property_row(db: Any, property_id: int) -> dict | None:
+    """Fresh property row with supply and sale price for invest funding checks."""
+    cursor = db.cursor(dictionary=True)
+    try:
+        row = lock_property(cursor, property_id)
+        if not row:
+            return None
+        return enrich_property_with_supply(cursor, row)
+    finally:
+        cursor.close()
+
+
+def _gate_invest_funding(
+    user: AuthUser,
+    property_item: dict,
+    token_amount: int,
+    accumulated: dict[str, str],
+) -> ToolResult | None:
+    """Block MetaMask when wallet ETH is below the order total."""
+    try:
+        funding = check_investor_can_fund_investment(
+            user.wallet_address or "",
+            property_item,
+            token_amount,
+        )
+    except InvestmentFundingError as exc:
+        return ToolResult(
+            ok=False,
+            error=str(exc),
+            data={
+                "filled": accumulated,
+                "missing": [],
+                "submitted": False,
+                "next_field": "token_amount",
+            },
+        )
+
+    if funding.ok:
+        return None
+
+    _set_workflow_session(
+        _INVEST_MODAL,
+        {
+            "in_progress": True,
+            "filled": accumulated,
+            "next_field": "token_amount",
+            "submitted": False,
+            "completing_submit": False,
+            "property_id": int(property_item.get("id") or 0) or None,
+        },
+    )
+    return ToolResult(
+        ok=True,
+        data={
+            "filled": accumulated,
+            "missing": [],
+            "submitted": False,
+            "insufficient_funds": True,
+            "required_eth": funding.required_eth,
+            "wallet_eth": funding.balance_eth,
+            "shortfall_eth": funding.shortfall_eth,
+            "speak_to_user": funding.speak_to_user,
+            "instruction": funding.instruction,
+        },
+        actions=[],
+    )
+
+
 async def _start_invest_property(_args: dict, _user: AuthUser, _db: Any) -> ToolResult:
     """Begin guided invest: ask property name first, then token amount."""
     user_text = extract_last_human_utterance(_current_history())
@@ -2783,6 +2855,7 @@ async def _fill_invest_property(args: dict, _user: AuthUser, db: Any) -> ToolRes
 
     property_id: int | None = None
     resolved_name: str | None = None
+    resolved_prop: dict | None = None
     if accumulated.get("property_name"):
         prop, err = _resolve_property_by_name(db, accumulated["property_name"])
         if err:
@@ -2797,6 +2870,7 @@ async def _fill_invest_property(args: dict, _user: AuthUser, db: Any) -> ToolRes
                     "submitted": False,
                 },
             )
+        resolved_prop = prop
         property_id = int(prop["id"])
         resolved_name = str(prop.get("name") or accumulated["property_name"])
         accumulated["property_id"] = str(property_id)
@@ -2841,6 +2915,34 @@ async def _fill_invest_property(args: dict, _user: AuthUser, db: Any) -> ToolRes
                 error="token_amount must be at least 1.",
                 data={"filled": accumulated, "missing": ["token_amount"], "next_field": "token_amount"},
             )
+
+        property_row = resolved_prop
+        if db is not None:
+            property_row = _load_invest_property_row(db, property_id) or property_row
+        if not property_row:
+            return ToolResult(
+                ok=False,
+                error="Property not found for investment.",
+                data={"filled": accumulated, "missing": [], "submitted": False},
+            )
+        investable_err = _validate_property_investable(property_row)
+        if investable_err:
+            return ToolResult(
+                ok=False,
+                error=investable_err,
+                data={
+                    "filled": accumulated,
+                    "missing": [],
+                    "submitted": False,
+                    "next_field": "property_name",
+                },
+            )
+
+        funding_block = _gate_invest_funding(
+            _user, property_row, token_amount, accumulated
+        )
+        if funding_block is not None:
+            return funding_block
 
         _set_workflow_session(
             modal,

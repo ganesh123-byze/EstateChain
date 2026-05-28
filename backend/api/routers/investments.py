@@ -33,6 +33,11 @@ from backend.services.blockchain import (
     to_base_units,
     wait_for_transaction_receipt,
 )
+from backend.services.investment_funding import (
+    InvestmentFundingError,
+    investment_required_wei,
+    read_sale_price_per_token_wei,
+)
 from backend.services.blockchain_indexer import reconcile_transaction
 
 router = APIRouter()
@@ -136,15 +141,9 @@ def prepare_investment(
         token_contract = get_contract("SecurityToken", property_item["token_address"])
         token_checksum = web3.to_checksum_address(property_item["token_address"])
         try:
-            sale_price_per_token_wei = int(
-                token_contract.functions.salePricePerTokenWei().call()
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502, detail=f"Failed to read on-chain sale price: {exc}"
-            )
-        if sale_price_per_token_wei <= 0:
-            raise HTTPException(status_code=400, detail="On-chain sale price is zero")
+            sale_price_per_token_wei = read_sale_price_per_token_wei(property_item)
+        except InvestmentFundingError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         # invest() pulls ERC20 from the token contract's own balance — not the investor's ETH balance.
         try:
@@ -166,8 +165,10 @@ def prepare_investment(
                 ),
             )
 
-        # token_amount is a human count; invest() multiplies by 10**decimals internally.
-        required_wei = sale_price_per_token_wei * int(payload.token_amount)
+        try:
+            required_wei = investment_required_wei(property_item, int(payload.token_amount))
+        except InvestmentFundingError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         eth_amount = from_wei(required_wei)
 
         cursor.execute(

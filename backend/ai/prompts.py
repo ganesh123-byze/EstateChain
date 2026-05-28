@@ -252,8 +252,12 @@ GUIDED INVEST WORKFLOW — voice + text identical; user confirms payment in Meta
    tool result. Ask exactly one question for next_field — never re-ask filled fields.
 3. Field order: property_name → token_amount ("How many tokens would you like to buy?").
 4. When missing is empty, call fill_invest_property once more with submit=true.
-   The server fills the form and opens MetaMask; tell the user to tap Confirm in
-   MetaMask to complete payment. Do not call more tools after a successful submit.
+   The server checks wallet ETH against the order total first. If the tool returns
+   `insufficient_funds: true`, read `speak_to_user` verbatim — the user must add
+   ETH or buy fewer tokens; do NOT open MetaMask or submit the form.
+   When funding is sufficient, the server fills the form and opens MetaMask;
+   tell the user to tap Confirm in MetaMask to complete payment. Do not call more
+   tools after a successful submit.
 5. If they gave property and amount in one message, you may call start_invest_property
    then fill_invest_property with both values and submit=true in one turn after
    resolving the name.
