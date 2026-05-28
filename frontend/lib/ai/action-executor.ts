@@ -5,8 +5,11 @@ import { getRoleFromPath, type RoleKey } from "./quick-actions";
 
 const delay = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
-/** Investor copilot must never auto-submit on-chain dialogs from chat. */
-const INVESTOR_NO_AUTO_SUBMIT_MODALS = new Set(["INVEST_PROPERTY", "CLAIM_REWARDS"]);
+/**
+ * Keep claim guarded; invest submit is allowed when backend explicitly emits it
+ * after guided confirmation fields are collected.
+ */
+const INVESTOR_NO_AUTO_SUBMIT_MODALS = new Set(["CLAIM_REWARDS"]);
 
 const MODAL_RETRIES = 6;
 const MODAL_RETRY_DELAY = 220;

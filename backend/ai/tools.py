@@ -347,6 +347,53 @@ def _filter_properties_by_fuzzy_search(items: list[dict], query: str) -> list[di
     return [prop for _score, prop in scored]
 
 
+def _resolve_investable_property_from_items(
+    items: list[dict], query: str
+) -> tuple[dict | None, str | None]:
+    """Resolve a spoken property query to a single investable listing."""
+    q = (query or "").strip()
+    if not q:
+        return None, "Property name is required."
+
+    investable: list[dict] = []
+    for prop in items:
+        if _validate_property_investable(prop) is None:
+            investable.append(prop)
+
+    if not investable:
+        return None, "No investable properties are available right now."
+
+    ranked = sorted(
+        [(_property_match_score(q, p), p) for p in investable],
+        key=lambda item: (item[0], int(item[1].get("id") or 0)),
+        reverse=True,
+    )
+    if not ranked:
+        return None, "No investable properties are available right now."
+
+    # Strong threshold prevents weak fuzzy matches from picking unrelated properties.
+    strong = [(score, prop) for score, prop in ranked if score >= 0.72]
+    if not strong:
+        best_score, _best_prop = ranked[0]
+        if best_score < 0.58:
+            examples = ", ".join((p.get("name") or f"#{p.get('id')}") for _, p in ranked[:3])
+            return None, (
+                f"No investable property found matching {q!r}. "
+                f"Try one of: {examples}."
+            )
+        # Medium-confidence fallback: ask clarification instead of risky auto-pick.
+        options = ", ".join((p.get("name") or f"#{p.get('id')}") for _, p in ranked[:3])
+        return None, (
+            f"Please confirm which property you want: {options}."
+        )
+
+    if len(strong) > 1 and (strong[0][0] - strong[1][0]) < 0.08:
+        names = ", ".join((p.get("name") or f"#{p.get('id')}") for _, p in strong[:3])
+        return None, f"Several investable properties match {q!r}: {names}. Which one do you mean?"
+
+    return strong[0][1], None
+
+
 # ---------------------------------------------------------------------------
 # Read tools — all roles
 # ---------------------------------------------------------------------------
@@ -2260,33 +2307,12 @@ def _validate_property_investable(prop: dict) -> str | None:
 def _resolve_property_by_name(db: Any, name: str) -> tuple[dict | None, str | None]:
     """Fuzzy-match a spoken property name to a single investable listing."""
     query = (name or "").strip()
-    if not query:
-        return None, "Property name is required."
     cursor = db.cursor(dictionary=True)
     try:
         items = _list_properties(cursor)
     finally:
         cursor.close()
-    matches = _filter_properties_by_fuzzy_search(items, query)
-    if not matches:
-        return None, (
-            f"No property found matching {query!r}. Ask the user for the exact "
-            "property name or call list_properties to suggest options."
-        )
-    if len(matches) > 1:
-        top, second = matches[0], matches[1]
-        gap = _property_match_score(query, top) - _property_match_score(query, second)
-        if gap < 0.08:
-            names = ", ".join(p.get("name") or f"#{p.get('id')}" for p in matches[:3])
-            return None, (
-                f"Several properties match {query!r}: {names}. "
-                "Ask which one the user means."
-            )
-    prop = matches[0]
-    err = _validate_property_investable(prop)
-    if err:
-        return None, err
-    return prop, None
+    return _resolve_investable_property_from_items(items, query)
 
 
 def _invest_actions_on_submit(property_id: int, token_amount: str) -> list[AgentAction]:
