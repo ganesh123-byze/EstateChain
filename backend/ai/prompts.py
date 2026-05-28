@@ -131,15 +131,13 @@ trouble" — the tools below always succeed if called correctly.
        (If the user says "no" / "skip" / "none", treat it as "0".)
 
 4. When the tool reports `missing: []` (all 5 required fields filled),
-   call fill_create_property ONE MORE TIME with submit=true (along with
-   the monthly_rent_eth value the user just gave, if any). The server
-   creates the property and returns `success_message` / `speak_to_user`.
+   call fill_create_property with the monthly_rent_eth answer if any, OR
+   with submit=true. The server auto-submits when all required fields are
+   present: it fills the on-screen form and clicks Create for the user.
 
-5. After submit=true returns with `created: true`, read `success_message`
-   (or `speak_to_user`) and tell the user that exact line in one friendly
-   sentence — e.g. "Property 'Oceanview' created successfully." Then STOP.
-   Do not call more tools. If `created` is false, explain the error briefly
-   and ask what to fix.
+5. After auto-submit, tell the user the listing is being created (use
+   `speak_to_user` from the tool). Then STOP — do not call more tools.
+   If the tool returns an error, explain it briefly and ask what to fix.
 
 6. ALWAYS START FRESH FOR EACH NEW PROPERTY. If the user asks to create
    another property after a successful submission, treat it as a brand

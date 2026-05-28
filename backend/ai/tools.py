@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
 
+from backend.ai.workflow_parsers import normalize_create_property_accumulated, normalize_create_property_field
 from backend.ai.investor_guards import (
     claim_tool_blocked_message,
     extract_last_human_utterance,
@@ -168,7 +169,10 @@ def _merge_last_user_utterance(
 
     text = _message_content(hist[last_human_idx])
     if text:
-        accumulated[next_field] = text
+        value = text
+        if modal == "CREATE_PROPERTY":
+            value = normalize_create_property_field(next_field, text)
+        accumulated[next_field] = value
     return accumulated
 
 
@@ -1681,16 +1685,25 @@ def _build_fill_workflow(
         value = args.get(field)
         if value is None or value == "":
             continue
-        accumulated[field] = str(value)
+        raw = str(value)
+        if modal == "CREATE_PROPERTY":
+            raw = normalize_create_property_field(field, raw)
+        accumulated[field] = raw
 
     accumulated = _merge_last_user_utterance(accumulated, modal, fields, required)
 
-    for field, value in accumulated.items():
+    if modal == "CREATE_PROPERTY":
+        accumulated = normalize_create_property_accumulated(accumulated)
+
+    for field in fields:
+        value = accumulated.get(field)
+        if value in (None, ""):
+            continue
         actions.append(AgentAction(
             type="FILL_FIELD",
             modal=modal,
             field=field,
-            value=value,
+            value=str(value),
         ))
 
     missing = [f for f in required if f not in accumulated or accumulated.get(f) in (None, "")]
@@ -1795,6 +1808,24 @@ def _create_property_success_message(name: str) -> str:
     return "Property created successfully."
 
 
+def _create_property_ui_submit_actions(accumulated: dict[str, str]) -> list[AgentAction]:
+    """Fill every collected field on-screen, then click Create (frontend runs the pipeline)."""
+    modal = "CREATE_PROPERTY"
+    actions: list[AgentAction] = [
+        AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+        AgentAction(type="OPEN_MODAL", modal=modal),
+    ]
+    for field in _CREATE_PROPERTY_FIELDS:
+        value = accumulated.get(field)
+        if value in (None, ""):
+            continue
+        actions.append(
+            AgentAction(type="FILL_FIELD", modal=modal, field=field, value=str(value))
+        )
+    actions.append(AgentAction(type="SUBMIT_FORM", modal=modal))
+    return actions
+
+
 async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResult:
     """Drive the Create Property workflow and create the listing on submit.
 
@@ -1804,6 +1835,19 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     success in the very next reply (no dependency on a frontend completion event).
     """
     LOGGER.info("[fill_create_property] args=%s", args)
+
+    # When every required field is present, auto-submit — do not wait for a second LLM turn.
+    if not bool(args.get("submit")):
+        preview = _build_fill_workflow(
+            args,
+            modal="CREATE_PROPERTY",
+            tool_name="fill_create_property",
+            fields=_CREATE_PROPERTY_FIELDS,
+            required=_CREATE_PROPERTY_FIELDS[:5],
+        )
+        if not (preview.data or {}).get("missing"):
+            return await _fill_create_property({**args, "submit": True}, user, db)
+
     result = _build_fill_workflow(
         args,
         modal="CREATE_PROPERTY",
@@ -1814,65 +1858,35 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
 
     data = dict(result.data or {})
     actions = list(result.actions)
-    accumulated = dict(data.get("filled") or {})
+    accumulated = normalize_create_property_accumulated(dict(data.get("filled") or {}))
+    data["filled"] = accumulated
     submitted = bool(args.get("submit")) and not data.get("missing")
 
     if submitted:
-        try:
-            payload = _property_create_payload_from_accumulated(accumulated)
-            created = await asyncio.to_thread(create_property_record, db, user, payload)
-            property_name = str(accumulated.get("name") or created.get("name") or "")
-            success_message = _create_property_success_message(property_name)
-            data.update(
-                {
-                    "submitted": True,
-                    "created": True,
-                    "submitting": False,
-                    "awaiting_ui_confirmation": False,
-                    "success_message": success_message,
-                    "property_id": int(created["id"]),
-                    "speak_to_user": success_message,
-                }
-            )
-            actions = [
-                AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-            ]
-            LOGGER.info(
-                "[fill_create_property] created property_id=%s message=%s",
-                data.get("property_id"),
-                success_message,
-            )
-            _clear_workflow_session("CREATE_PROPERTY")
-            return ToolResult(ok=True, data=data, actions=actions)
-        except HTTPException as exc:
-            detail = exc.detail
-            if isinstance(detail, dict):
-                detail = detail.get("message") or str(detail)
-            err = str(detail or "Property creation failed.")
-            LOGGER.warning("[fill_create_property] create failed: %s", err)
-            return ToolResult(
-                ok=False,
-                error=err,
-                data={**data, "submitted": True, "created": False},
-                actions=[
-                    AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-                    AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
-                    *actions,
-                ],
-            )
-        except Exception as exc:  # noqa: BLE001
-            err = str(exc)[:300]
-            LOGGER.exception("[fill_create_property] create failed")
-            return ToolResult(
-                ok=False,
-                error=err,
-                data={**data, "submitted": True, "created": False},
-                actions=[
-                    AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-                    AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
-                    *actions,
-                ],
-            )
+        property_name = str(accumulated.get("name") or "property")
+        data.update(
+            {
+                "submitted": True,
+                "submitting": True,
+                "awaiting_ui_confirmation": True,
+                "auto_submit": True,
+                "speak_to_user": (
+                    f"Submitting {property_name} now — the form will fill and create the listing."
+                ),
+                "instruction": (
+                    "Tell the user the property form is submitting. Do not call more tools "
+                    "until they see success."
+                ),
+            }
+        )
+        actions = _create_property_ui_submit_actions(accumulated)
+        LOGGER.info(
+            "[fill_create_property] auto-submit actions=%d filled=%s",
+            len(actions),
+            accumulated,
+        )
+        _clear_workflow_session("CREATE_PROPERTY")
+        return ToolResult(ok=True, data=data, actions=actions)
 
     LOGGER.info(
         "[fill_create_property] filled=%s missing=%s next=%s submitting=%s actions=%d",
@@ -1882,11 +1896,9 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
         submitted,
         len(actions),
     )
-    if not submitted and actions:
-        actions = [
-            AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-            AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
-        ] + actions
+    # Only FILL_FIELD actions — never re-OPEN_MODAL mid-flow (client resets the form).
+    if actions:
+        actions = [AgentAction(type="NAVIGATE", route="/property_owner/properties"), *actions]
     return ToolResult(ok=result.ok, data=data, error=result.error, actions=actions)
 
 
@@ -1899,12 +1911,10 @@ register(ToolSpec(
         "(every value collected so far), `missing` (required fields still "
         "empty), and `next_field` (the single field to ask about next). "
         "NEVER ask about a field that already appears in `filled`. When "
-        "`missing` is empty, call this tool ONE more time with submit=true. "
-        "The server creates the property and returns `success_message` plus "
-        "`speak_to_user`. Read those fields and tell the user that exact success "
-        "line in a warm, concise sentence — do not say \"submitting\" or wait for "
-        "another event. If `created` is false, explain the `error` and ask how to "
-        "proceed. Do not call more tools after a successful create."
+        "`missing` is empty the server auto-fills the form and submits it "
+        "(you may pass submit=true explicitly). Pass spoken numbers as-is "
+        "(e.g. 'one lakh tokens', 'USD symbol') — the server normalizes them. "
+        "Do not call more tools after a successful auto-submit."
     ),
     parameters={
         "type": "object",
