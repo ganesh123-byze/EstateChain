@@ -1633,14 +1633,47 @@ _CREATE_PROPERTY_FIELDS = (
     "token_symbol",
     "monthly_rent_eth",
 )
+_CREATE_PROPERTY_MODAL = "CREATE_PROPERTY"
+
+
+def _assistant_announced_property_created(text: str) -> bool:
+    """Detect copilot success lines like \"Property 'X' created successfully.\" """
+    lowered = (text or "").lower()
+    return "created successfully" in lowered and "property" in lowered
+
+
+def _mark_create_property_completed(property_name: str = "") -> None:
+    """Start a fresh post-success session so the next property in the same chat bootstraps UI."""
+    _set_workflow_session(
+        _CREATE_PROPERTY_MODAL,
+        {
+            "in_progress": False,
+            "submitted": True,
+            "awaiting_new_property": True,
+            "filled": {},
+            "next_field": "name",
+            "last_created_name": (property_name or "").strip(),
+        },
+    )
+
+
+def _create_property_session_needs_ui_bootstrap(session: dict[str, Any]) -> bool:
+    """True when the Create dialog must be navigated/opened before fill/submit."""
+    if session.get("awaiting_new_property"):
+        return True
+    return not bool(session.get("in_progress"))
 
 
 async def _start_create_property(_args: dict, _user: AuthUser, _db: Any) -> ToolResult:
-    modal = "CREATE_PROPERTY"
+    modal = _CREATE_PROPERTY_MODAL
     required = _CREATE_PROPERTY_FIELDS[:5]
     session = _get_workflow_session(modal)
-    # True restart only after a completed submit or when nothing was collected yet.
-    if session.get("submitted") or not session.get("filled"):
+    # True restart after a completed submit, post-success boundary, or empty draft.
+    if (
+        session.get("awaiting_new_property")
+        or session.get("submitted")
+        or not session.get("filled")
+    ):
         _clear_workflow_session(modal)
         session = {}
     filled = dict(session.get("filled") or {})
@@ -1728,16 +1761,24 @@ def _recover_form_state(modal: str, tool_name: str, fields: tuple[str, ...]) -> 
     accumulated: dict[str, str] = {}
     session = _get_workflow_session(modal)
     session_filled = session.get("filled") or {}
+    if modal == _CREATE_PROPERTY_MODAL and session.get("awaiting_new_property"):
+        session_filled = {}
     if isinstance(session_filled, dict):
         for k, v in session_filled.items():
             if k in fields and v not in (None, ""):
                 accumulated[k] = str(v)
 
     for msg in _current_history() or []:
+        role = _message_role(msg)
         name = getattr(msg, "name", None) or (msg.get("name") if isinstance(msg, dict) else None)
         content = getattr(msg, "content", None)
         if content is None and isinstance(msg, dict):
             content = msg.get("content")
+
+        if modal == _CREATE_PROPERTY_MODAL and role in ("ai", "assistant"):
+            if _assistant_announced_property_created(_message_content(msg)):
+                accumulated = {}
+                continue
 
         # start_* is handled via the session store (client history has no tools).
         if name == start_tool:
@@ -1869,15 +1910,15 @@ def _build_fill_workflow(
             actions=actions,
         )
 
-    _set_workflow_session(
-        modal,
-        {
-            "in_progress": True,
-            "filled": accumulated,
-            "next_field": next_field,
-            "submitted": False,
-        },
-    )
+    session_payload: dict[str, Any] = {
+        "in_progress": True,
+        "filled": accumulated,
+        "next_field": next_field,
+        "submitted": False,
+    }
+    if modal == _CREATE_PROPERTY_MODAL:
+        session_payload["awaiting_new_property"] = False
+    _set_workflow_session(modal, session_payload)
     return ToolResult(
         ok=True,
         data={
@@ -1952,8 +1993,12 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     property server-side and return ``success_message`` so the copilot can confirm
     success in the very next reply (no dependency on a frontend completion event).
     """
+    force_ui_bootstrap = bool(args.pop("_force_create_property_bootstrap", False))
     LOGGER.info("[fill_create_property] args=%s", args)
-    pre_session = _get_workflow_session("CREATE_PROPERTY")
+    pre_session = _get_workflow_session(_CREATE_PROPERTY_MODAL)
+    needs_ui_bootstrap = force_ui_bootstrap or _create_property_session_needs_ui_bootstrap(
+        pre_session
+    )
 
     # Defensive reset: if a stale in-progress session exists but the user starts
     # naming a different property, treat this as a new create workflow. This
@@ -1971,12 +2016,17 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
         and session_name
         and incoming_name.lower() != session_name.lower()
         and pre_session.get("in_progress")
+        and not pre_session.get("awaiting_new_property")
     ):
-        _clear_workflow_session("CREATE_PROPERTY")
+        _clear_workflow_session(_CREATE_PROPERTY_MODAL)
         pre_session = {}
-    had_active_session = bool(pre_session.get("in_progress"))
+        needs_ui_bootstrap = True
+    had_active_session = bool(
+        pre_session.get("in_progress") and not pre_session.get("awaiting_new_property")
+    )
 
     # When every required field is present, auto-submit — do not wait for a second LLM turn.
+    bootstrap_for_turn = needs_ui_bootstrap
     if not bool(args.get("submit")):
         preview = _build_fill_workflow(
             args,
@@ -1986,7 +2036,15 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
             required=_CREATE_PROPERTY_FIELDS[:5],
         )
         if not (preview.data or {}).get("missing"):
-            return await _fill_create_property({**args, "submit": True}, user, db)
+            return await _fill_create_property(
+                {
+                    **args,
+                    "submit": True,
+                    "_force_create_property_bootstrap": bootstrap_for_turn,
+                },
+                user,
+                db,
+            )
 
     result = _build_fill_workflow(
         args,
@@ -2019,15 +2077,24 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
                 ),
             }
         )
+        submit_bootstrap = bootstrap_for_turn or needs_ui_bootstrap or not had_active_session
         actions = _create_property_ui_submit_actions(
-            accumulated, bootstrap_ui=(not had_active_session)
+            accumulated, bootstrap_ui=submit_bootstrap
         )
         LOGGER.info(
-            "[fill_create_property] auto-submit actions=%d filled=%s",
+            "[fill_create_property] auto-submit actions=%d filled=%s bootstrap=%s",
             len(actions),
             accumulated,
+            submit_bootstrap,
         )
-        _clear_workflow_session("CREATE_PROPERTY")
+        _mark_create_property_completed(property_name)
+        data["new_property_session"] = True
+        data["instruction"] = (
+            "Tell the user the property form is submitting. Do not call more tools "
+            "until they see success. After you confirm success (e.g. "
+            "'Property created successfully'), the next property in this chat "
+            "must call start_create_property again."
+        )
         return ToolResult(ok=True, data=data, actions=actions)
 
     LOGGER.info(
@@ -2044,11 +2111,11 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     # current fill call carried no field payload.
     #
     # During an active workflow we avoid OPEN_MODAL because the dialog listener
-    # resets form state on open.
-    if not had_active_session:
+    # resets form state on open. After a prior successful create, always bootstrap.
+    if needs_ui_bootstrap or not had_active_session:
         actions = [
             AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-            AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
+            AgentAction(type="OPEN_MODAL", modal=_CREATE_PROPERTY_MODAL),
             *actions,
         ]
     return ToolResult(ok=result.ok, data=data, error=result.error, actions=actions)

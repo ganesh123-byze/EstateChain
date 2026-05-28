@@ -6,6 +6,8 @@ import asyncio
 from backend.ai.tools import (
     _clear_workflow_session,
     _fill_create_property,
+    _get_workflow_session,
+    _mark_create_property_completed,
     set_current_thread_id,
     reset_current_thread_id,
 )
@@ -99,6 +101,52 @@ def test_fill_create_active_session_emits_no_navigate_or_open():
         assert second.ok
         assert not any(a.type == "NAVIGATE" for a in second.actions)
         assert not any(a.type == "OPEN_MODAL" and a.modal == "CREATE_PROPERTY" for a in second.actions)
+    finally:
+        _clear_workflow_session("CREATE_PROPERTY")
+        reset_current_thread_id(token)
+
+
+def test_second_property_after_success_session_opens_modal_on_first_fill():
+    token = set_current_thread_id("test:create:post-success-session")
+    try:
+        _clear_workflow_session("CREATE_PROPERTY")
+        _mark_create_property_completed("chatgpt")
+        session = _get_workflow_session("CREATE_PROPERTY")
+        assert session.get("awaiting_new_property") is True
+
+        res = asyncio.run(_fill_create_property({"name": "Second Tower"}, _dummy_owner(), None))
+        assert res.ok
+        assert any(a.type == "OPEN_MODAL" and a.modal == "CREATE_PROPERTY" for a in res.actions)
+        assert any(a.type == "NAVIGATE" and a.route == "/property_owner/properties" for a in res.actions)
+    finally:
+        _clear_workflow_session("CREATE_PROPERTY")
+        reset_current_thread_id(token)
+
+
+def test_second_property_after_success_session_bootstraps_on_auto_submit():
+    token = set_current_thread_id("test:create:post-success-submit")
+    try:
+        _clear_workflow_session("CREATE_PROPERTY")
+        _mark_create_property_completed("chatgpt")
+        final = asyncio.run(
+            _fill_create_property(
+                {
+                    "name": "Harbor Two",
+                    "location": "Boston",
+                    "total_value": "15",
+                    "token_supply": "15000",
+                    "token_symbol": "HB2",
+                },
+                _dummy_owner(),
+                None,
+            )
+        )
+        assert final.ok
+        assert any(a.type == "SUBMIT_FORM" and a.modal == "CREATE_PROPERTY" for a in final.actions)
+        assert any(a.type == "OPEN_MODAL" and a.modal == "CREATE_PROPERTY" for a in final.actions)
+        assert any(a.type == "NAVIGATE" and a.route == "/property_owner/properties" for a in final.actions)
+        after = _get_workflow_session("CREATE_PROPERTY")
+        assert after.get("awaiting_new_property") is True
     finally:
         _clear_workflow_session("CREATE_PROPERTY")
         reset_current_thread_id(token)
