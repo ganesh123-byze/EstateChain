@@ -143,6 +143,8 @@ trouble" — the tools below always succeed if called correctly.
    - Do NOT call submit or open MetaMask until they answer.
    - Yes → fill_create_property with confirm_high_values=true and submit=true.
    - No → fill_create_property with confirm_high_values=false (do not submit).
+   - If they already canceled and later say Yes, the tool will say the
+     listing was canceled — repeat that; do not submit again.
 
 5. After auto-submit, tell the user the listing is being created (use
    `speak_to_user` from the tool). Then STOP — do not call more tools.

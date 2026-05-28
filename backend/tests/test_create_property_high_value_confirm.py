@@ -113,7 +113,48 @@ def test_fill_create_cancels_when_user_says_no():
         )
         assert res.ok
         assert res.data.get("cancelled") is True
+        assert res.data.get("property_create_cancelled") is True
         assert not any(a.type == "SUBMIT_FORM" for a in res.actions)
     finally:
         _clear_workflow_session("CREATE_PROPERTY")
+        reset_current_thread_id(token)
+
+
+def test_fill_create_yes_after_cancel_says_listing_canceled():
+    token = set_current_thread_id("test:create:high-value-yes-after-cancel")
+    msg_token = set_current_messages(
+        [
+            {"type": "ai", "content": "Do you want to proceed? Reply Yes or No."},
+            {"type": "human", "content": "yes"},
+        ]
+    )
+    try:
+        _clear_workflow_session("CREATE_PROPERTY")
+        tools._set_workflow_session(
+            "CREATE_PROPERTY",
+            {
+                "in_progress": True,
+                "filled": {
+                    "name": "Big",
+                    "location": "LA",
+                    "total_value": "80",
+                    "token_supply": "90000",
+                    "token_symbol": "BIG",
+                    "monthly_rent_eth": "12",
+                },
+                "property_create_cancelled": True,
+                "awaiting_high_value_confirmation": False,
+                "high_values_confirmed": False,
+            },
+        )
+        res = asyncio.run(
+            _fill_create_property({"submit": True}, _owner(), None)
+        )
+        assert res.ok
+        assert res.data.get("property_create_cancelled") is True
+        assert "canceled" in str(res.data.get("speak_to_user")).lower()
+        assert not any(a.type == "SUBMIT_FORM" for a in res.actions)
+    finally:
+        _clear_workflow_session("CREATE_PROPERTY")
+        reset_current_messages(msg_token)
         reset_current_thread_id(token)

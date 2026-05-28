@@ -1675,6 +1675,7 @@ def _mark_create_property_completed(property_name: str = "") -> None:
             "last_created_name": (property_name or "").strip(),
             "awaiting_high_value_confirmation": False,
             "high_values_confirmed": False,
+            "property_create_cancelled": False,
         },
     )
 
@@ -1710,6 +1711,7 @@ async def _start_create_property(_args: dict, _user: AuthUser, _db: Any) -> Tool
             "submitted": False,
             "awaiting_high_value_confirmation": False,
             "high_values_confirmed": False,
+            "property_create_cancelled": False,
         },
     )
     focus_field = next_field or "name"
@@ -1945,9 +1947,14 @@ def _build_fill_workflow(
         "submitted": False,
     }
     if modal == _CREATE_PROPERTY_MODAL:
+        prev = _get_workflow_session(modal) or {}
         session_payload["awaiting_new_property"] = False
         session_payload.setdefault("awaiting_high_value_confirmation", False)
         session_payload.setdefault("high_values_confirmed", False)
+        if _create_property_args_change_fields(args):
+            session_payload["property_create_cancelled"] = False
+        elif prev.get("property_create_cancelled"):
+            session_payload["property_create_cancelled"] = True
     _set_workflow_session(modal, session_payload)
     return ToolResult(
         ok=True,
@@ -1986,6 +1993,69 @@ def _create_property_success_message(name: str) -> str:
     return "Property created successfully."
 
 
+def _create_property_args_change_fields(args: dict) -> bool:
+    """True when fill_create_property carries a property field edit (not only submit/confirm)."""
+    for field in _CREATE_PROPERTY_FIELDS:
+        if field in args and args.get(field) not in (None, ""):
+            return True
+    return False
+
+
+def _user_wants_proceed_after_create_cancel(args: dict) -> bool:
+    """Detect Yes / submit after the user already declined high-value confirmation."""
+    if bool(args.get("submit")):
+        return True
+    if args.get("confirm_high_values") is True:
+        return True
+    for msg in reversed(_current_history() or []):
+        if _message_role(msg) not in ("human", "user"):
+            continue
+        text = _message_content(msg)
+        if not text:
+            continue
+        yn = parse_yes_no_confirmation(text)
+        if yn is True:
+            return True
+        if yn is False:
+            return False
+    return False
+
+
+def _block_retry_after_create_cancel(
+    args: dict, session: dict[str, Any]
+) -> ToolResult | None:
+    """After the user said No to high-value confirm, Yes must not re-submit."""
+    if not session.get("property_create_cancelled"):
+        return None
+    if _create_property_args_change_fields(args):
+        return None
+    if not _user_wants_proceed_after_create_cancel(args):
+        return None
+    accumulated = normalize_create_property_accumulated(
+        dict(session.get("filled") or {})
+    )
+    speak = (
+        "This property listing has been canceled. "
+        "To list a property, change a field or start a new listing."
+    )
+    return ToolResult(
+        ok=True,
+        data={
+            "filled": accumulated,
+            "missing": [],
+            "submitted": False,
+            "cancelled": True,
+            "property_create_cancelled": True,
+            "speak_to_user": speak,
+            "instruction": (
+                "Tell the user clearly that this property listing has been canceled. "
+                "Do not submit the form or call more tools."
+            ),
+        },
+        actions=[],
+    )
+
+
 def _resolve_create_high_value_confirmation(
     args: dict, session: dict[str, Any]
 ) -> bool | None:
@@ -2012,6 +2082,10 @@ def _gate_high_value_create_submit(
     session: dict[str, Any],
 ) -> ToolResult | None:
     """Block auto-submit until the user confirms high values (Yes) or cancels (No)."""
+    blocked = _block_retry_after_create_cancel(args, session)
+    if blocked is not None:
+        return blocked
+
     if session.get("high_values_confirmed"):
         return None
 
@@ -2031,11 +2105,12 @@ def _gate_high_value_create_submit(
                 "submitted": False,
                 "awaiting_high_value_confirmation": False,
                 "high_values_confirmed": False,
+                "property_create_cancelled": True,
                 "awaiting_new_property": False,
             },
         )
         speak = (
-            "Understood — I have not submitted the property. "
+            "Understood — this property listing has been canceled and was not submitted. "
             "Tell me which value you would like to change (name, location, "
             "total value, token supply, symbol, or monthly rent), or say "
             "you want to start over."
@@ -2047,6 +2122,7 @@ def _gate_high_value_create_submit(
                 "missing": [],
                 "submitted": False,
                 "cancelled": True,
+                "property_create_cancelled": True,
                 "high_value_confirmation": "declined",
                 "speak_to_user": speak,
                 "instruction": (
@@ -2167,6 +2243,10 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     had_active_session = bool(
         pre_session.get("in_progress") and not pre_session.get("awaiting_new_property")
     )
+
+    cancelled_retry = _block_retry_after_create_cancel(args, pre_session)
+    if cancelled_retry is not None:
+        return cancelled_retry
 
     # When every required field is present, auto-submit — do not wait for a second LLM turn.
     bootstrap_for_turn = needs_ui_bootstrap
