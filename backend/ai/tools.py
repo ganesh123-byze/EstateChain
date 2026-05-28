@@ -2434,6 +2434,13 @@ async def _fill_invest_property(args: dict, _user: AuthUser, db: Any) -> ToolRes
     missing = [f for f in _INVEST_REQUIRED if f not in accumulated or not accumulated.get(f)]
     submit = bool(args.get("submit"))
     next_field = missing[0] if missing else None
+
+    # Reliability guard: if all required invest fields are already present,
+    # auto-submit in this same turn so the workflow does not stall waiting for
+    # the model to make an extra submit=true tool call.
+    if not submit and not missing and property_id is not None:
+        return await _fill_invest_property({**args, "submit": True}, _user, db)
+
     instruction: str | None = None
     if accumulated and next_field:
         instruction = (
