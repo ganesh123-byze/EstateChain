@@ -8,8 +8,10 @@ from backend.ai.tools import (
     _fill_create_property,
     _get_workflow_session,
     _mark_create_property_completed,
-    set_current_thread_id,
+    reset_current_messages,
     reset_current_thread_id,
+    set_current_messages,
+    set_current_thread_id,
 )
 from backend.services.auth import AuthUser
 
@@ -23,6 +25,30 @@ def _dummy_owner() -> AuthUser:
         kyc_status="verified",
         active=True,
     )
+
+
+def test_fill_create_asks_name_after_list_property_quick_action():
+    token = set_current_thread_id("test:create:quick-action-name-first")
+    msg_token = set_current_messages(
+        [
+            {"type": "ai", "content": "Hi! I'm EstateChain Copilot."},
+            {
+                "type": "human",
+                "content": "Help me list a new property for tokenization.",
+            },
+        ]
+    )
+    try:
+        _clear_workflow_session("CREATE_PROPERTY")
+        res = asyncio.run(_fill_create_property({}, _dummy_owner(), None))
+        assert res.ok
+        filled = res.data.get("filled") or {}
+        assert "name" not in filled
+        assert res.data.get("next_field") == "name"
+    finally:
+        _clear_workflow_session("CREATE_PROPERTY")
+        reset_current_messages(msg_token)
+        reset_current_thread_id(token)
 
 
 def test_fill_create_opens_modal_when_start_was_skipped():

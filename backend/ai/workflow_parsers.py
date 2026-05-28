@@ -114,6 +114,70 @@ def _parse_decimal_amount(text: str) -> str | None:
         return None
 
 
+_CREATE_PROPERTY_INTENT_RE = re.compile(
+    r"(?i)(?:help\s+me\s+)?(?:list|create|add|register|tokenize)\s+(?:a\s+)?(?:new\s+)?propert"
+)
+
+
+def is_generic_create_property_intent(text: str) -> bool:
+    """True when the user is starting the workflow, not answering \"property name\"."""
+    t = _strip_noise(text).lower()
+    if not t:
+        return False
+    if _CREATE_PROPERTY_INTENT_RE.search(t):
+        return True
+    if "tokenization" in t and "propert" in t:
+        return True
+    if re.search(r"(?i)^(?:i\s+)?want\s+to\s+(?:list|create|add)\b", t) and "propert" in t:
+        return True
+    return False
+
+
+def assistant_prompted_for_create_field(assistant_text: str, field: str) -> bool:
+    """True when the latest assistant turn explicitly asked for ``field``."""
+    t = _strip_noise(assistant_text).lower()
+    if not t:
+        return False
+    prompts: dict[str, tuple[str, ...]] = {
+        "name": (
+            "name of the property",
+            "property name",
+            "what's the name",
+            "what is the name",
+            "whats the name",
+        ),
+        "location": (
+            "where is it located",
+            "where is the property",
+            "location of the property",
+            "what's the location",
+            "what is the location",
+            "whats the location",
+        ),
+        "total_value": (
+            "total property value",
+            "total value",
+            "value in eth",
+        ),
+        "token_supply": (
+            "how many ownership tokens",
+            "how many tokens",
+            "token supply",
+            "tokens should we mint",
+        ),
+        "token_symbol": (
+            "ticker symbol",
+            "token symbol",
+            "symbol do you want",
+        ),
+        "monthly_rent_eth": (
+            "monthly rent",
+            "rent in eth",
+        ),
+    }
+    return any(phrase in t for phrase in prompts.get(field, ()))
+
+
 def normalize_create_property_field(field: str, raw: str) -> str:
     """Map a single user answer onto a form-ready string for CREATE_PROPERTY."""
     text = _strip_noise(raw)
@@ -148,6 +212,8 @@ def normalize_create_property_field(field: str, raw: str) -> str:
         return amt if amt is not None else text
 
     if field == "name":
+        if is_generic_create_property_intent(text):
+            return ""
         # Drop leading filler: "the name is SpaceX" → SpaceX
         m = re.search(
             r"(?:name\s+is|called|property\s+is|it's|its)\s+(.+)$",

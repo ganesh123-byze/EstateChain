@@ -22,7 +22,12 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
 
-from backend.ai.workflow_parsers import normalize_create_property_accumulated, normalize_create_property_field
+from backend.ai.workflow_parsers import (
+    assistant_prompted_for_create_field,
+    is_generic_create_property_intent,
+    normalize_create_property_accumulated,
+    normalize_create_property_field,
+)
 from backend.ai.investor_guards import (
     claim_tool_blocked_message,
     extract_last_human_utterance,
@@ -172,11 +177,24 @@ def _merge_last_user_utterance(
         return accumulated
 
     text = _message_content(hist[last_human_idx])
-    if text:
-        value = text
-        if modal == "CREATE_PROPERTY":
-            value = normalize_create_property_field(next_field, text)
-        accumulated[next_field] = value
+    if not text:
+        return accumulated
+
+    if modal == _CREATE_PROPERTY_MODAL:
+        last_ai_text = (
+            _message_content(hist[last_ai_idx]) if last_ai_idx is not None else ""
+        )
+        if not assistant_prompted_for_create_field(last_ai_text, next_field):
+            return accumulated
+        if next_field == "name" and is_generic_create_property_intent(text):
+            return accumulated
+
+    value = text
+    if modal == _CREATE_PROPERTY_MODAL:
+        value = normalize_create_property_field(next_field, text)
+        if not value:
+            return accumulated
+    accumulated[next_field] = value
     return accumulated
 
 
@@ -1834,8 +1852,12 @@ def _build_fill_workflow(
         if value is None or value == "":
             continue
         raw = str(value)
-        if modal == "CREATE_PROPERTY":
+        if modal == _CREATE_PROPERTY_MODAL:
+            if field == "name" and is_generic_create_property_intent(raw):
+                continue
             raw = normalize_create_property_field(field, raw)
+            if not raw:
+                continue
         accumulated[field] = raw
 
     accumulated = _merge_last_user_utterance(accumulated, modal, fields, required)
