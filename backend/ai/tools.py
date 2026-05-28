@@ -1835,6 +1835,8 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     success in the very next reply (no dependency on a frontend completion event).
     """
     LOGGER.info("[fill_create_property] args=%s", args)
+    pre_session = _get_workflow_session("CREATE_PROPERTY")
+    had_active_session = bool(pre_session.get("in_progress"))
 
     # When every required field is present, auto-submit — do not wait for a second LLM turn.
     if not bool(args.get("submit")):
@@ -1896,9 +1898,19 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
         submitted,
         len(actions),
     )
-    # Only FILL_FIELD actions — never re-OPEN_MODAL mid-flow (client resets the form).
+    # If the model skipped start_create_property (common after a previous
+    # successful create in the same chat), open the dialog once so FILL_FIELD
+    # actions have a mounted form target. During an active workflow we avoid
+    # OPEN_MODAL because the dialog listener resets form state on open.
     if actions:
-        actions = [AgentAction(type="NAVIGATE", route="/property_owner/properties"), *actions]
+        if had_active_session:
+            actions = [AgentAction(type="NAVIGATE", route="/property_owner/properties"), *actions]
+        else:
+            actions = [
+                AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+                AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
+                *actions,
+            ]
     return ToolResult(ok=result.ok, data=data, error=result.error, actions=actions)
 
 
