@@ -106,7 +106,10 @@ def _parse_decimal_amount(text: str) -> str | None:
     if "." in raw:
         return raw
     try:
-        return str(Decimal(raw).normalize())
+        # Keep whole-number ETH values in plain decimal form (e.g. "20"),
+        # never scientific notation (e.g. "2E+1"), because subsequent
+        # regex-based normalization passes can truncate exponent strings.
+        return str(Decimal(raw))
     except (InvalidOperation, ValueError):
         return None
 

@@ -1808,13 +1808,24 @@ def _create_property_success_message(name: str) -> str:
     return "Property created successfully."
 
 
-def _create_property_ui_submit_actions(accumulated: dict[str, str]) -> list[AgentAction]:
-    """Fill every collected field on-screen, then click Create (frontend runs the pipeline)."""
+def _create_property_ui_submit_actions(
+    accumulated: dict[str, str], *, bootstrap_ui: bool
+) -> list[AgentAction]:
+    """Fill every collected field on-screen, then click Create.
+
+    ``bootstrap_ui=True`` is for flows where start_create_property was skipped:
+    we navigate/open once before filling. During an active flow we avoid extra
+    route/modal bootstrap because it can interrupt an already-mounted dialog.
+    """
     modal = "CREATE_PROPERTY"
-    actions: list[AgentAction] = [
-        AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-        AgentAction(type="OPEN_MODAL", modal=modal),
-    ]
+    actions: list[AgentAction] = []
+    if bootstrap_ui:
+        actions.extend(
+            [
+                AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+                AgentAction(type="OPEN_MODAL", modal=modal),
+            ]
+        )
     for field in _CREATE_PROPERTY_FIELDS:
         value = accumulated.get(field)
         if value in (None, ""):
@@ -1901,7 +1912,9 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
                 ),
             }
         )
-        actions = _create_property_ui_submit_actions(accumulated)
+        actions = _create_property_ui_submit_actions(
+            accumulated, bootstrap_ui=(not had_active_session)
+        )
         LOGGER.info(
             "[fill_create_property] auto-submit actions=%d filled=%s",
             len(actions),
@@ -1923,9 +1936,7 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     # actions have a mounted form target. During an active workflow we avoid
     # OPEN_MODAL because the dialog listener resets form state on open.
     if actions:
-        if had_active_session:
-            actions = [AgentAction(type="NAVIGATE", route="/property_owner/properties"), *actions]
-        else:
+        if not had_active_session:
             actions = [
                 AgentAction(type="NAVIGATE", route="/property_owner/properties"),
                 AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),

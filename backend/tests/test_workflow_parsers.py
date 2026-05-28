@@ -17,6 +17,10 @@ def test_monthly_rent_decimal():
     assert normalize_create_property_field("monthly_rent_eth", "The monthly rent is 0.010") == "0.010"
 
 
+def test_total_value_whole_number_stays_plain_decimal():
+    assert normalize_create_property_field("total_value", "20") == "20"
+
+
 def test_accumulated_normalization():
     out = normalize_create_property_accumulated(
         {
