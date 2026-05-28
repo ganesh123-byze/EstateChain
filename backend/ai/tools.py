@@ -1836,6 +1836,26 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     """
     LOGGER.info("[fill_create_property] args=%s", args)
     pre_session = _get_workflow_session("CREATE_PROPERTY")
+
+    # Defensive reset: if a stale in-progress session exists but the user starts
+    # naming a different property, treat this as a new create workflow. This
+    # covers same-chat "create another property" turns even when the model
+    # skips start_create_property.
+    incoming_name_raw = args.get("name")
+    incoming_name = (
+        normalize_create_property_field("name", str(incoming_name_raw))
+        if incoming_name_raw not in (None, "")
+        else ""
+    )
+    session_name = str((pre_session.get("filled") or {}).get("name") or "").strip()
+    if (
+        incoming_name
+        and session_name
+        and incoming_name.lower() != session_name.lower()
+        and pre_session.get("in_progress")
+    ):
+        _clear_workflow_session("CREATE_PROPERTY")
+        pre_session = {}
     had_active_session = bool(pre_session.get("in_progress"))
 
     # When every required field is present, auto-submit — do not wait for a second LLM turn.
