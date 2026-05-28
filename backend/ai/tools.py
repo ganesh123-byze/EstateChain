@@ -1932,16 +1932,18 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
         len(actions),
     )
     # If the model skipped start_create_property (common after a previous
-    # successful create in the same chat), open the dialog once so FILL_FIELD
-    # actions have a mounted form target. During an active workflow we avoid
-    # OPEN_MODAL because the dialog listener resets form state on open.
-    if actions:
-        if not had_active_session:
-            actions = [
-                AgentAction(type="NAVIGATE", route="/property_owner/properties"),
-                AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
-                *actions,
-            ]
+    # successful create in the same chat), bootstrap the UI once so subsequent
+    # FILL_FIELD actions have a mounted form target. We do this even if the
+    # current fill call carried no field payload.
+    #
+    # During an active workflow we avoid OPEN_MODAL because the dialog listener
+    # resets form state on open.
+    if not had_active_session:
+        actions = [
+            AgentAction(type="NAVIGATE", route="/property_owner/properties"),
+            AgentAction(type="OPEN_MODAL", modal="CREATE_PROPERTY"),
+            *actions,
+        ]
     return ToolResult(ok=result.ok, data=data, error=result.error, actions=actions)
 
 

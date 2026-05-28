@@ -35,6 +35,19 @@ def test_fill_create_opens_modal_when_start_was_skipped():
         reset_current_thread_id(token)
 
 
+def test_fill_create_bootstraps_modal_even_with_empty_args():
+    token = set_current_thread_id("test:create:empty-args-bootstrap")
+    try:
+        _clear_workflow_session("CREATE_PROPERTY")
+        res = asyncio.run(_fill_create_property({}, _dummy_owner(), None))
+        assert res.ok
+        assert any(a.type == "NAVIGATE" and a.route == "/property_owner/properties" for a in res.actions)
+        assert any(a.type == "OPEN_MODAL" and a.modal == "CREATE_PROPERTY" for a in res.actions)
+    finally:
+        _clear_workflow_session("CREATE_PROPERTY")
+        reset_current_thread_id(token)
+
+
 def test_fill_create_does_not_reopen_modal_mid_flow():
     token = set_current_thread_id("test:create:mid-flow")
     try:
