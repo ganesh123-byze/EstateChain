@@ -70,7 +70,7 @@ DATA LOOKUP GUIDE — pick the tool that matches the question:
 - "analytics / view analytics / dashboard overview / show me analytics /
   platform summary / properties rent and investors together" →
   view_analytics OR get_owner_analytics_overview (call ONE of these — they
-  return the same full snapshot). Then give a clear spoken summary: property
+  return the same full snapshot in chat; do NOT navigate pages). Then give a clear spoken summary: property
   counts, rent collected & distributed, active rentals, investor totals,
   highlights from recent rent payments and transactions.
 - "my properties / properties I own / summarize my properties" →

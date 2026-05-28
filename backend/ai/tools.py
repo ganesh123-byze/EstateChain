@@ -900,7 +900,7 @@ async def _get_owner_analytics_overview(_args: dict, user: AuthUser, db: Any) ->
     return ToolResult(
         ok=True,
         data=data,
-        actions=[AgentAction(type="NAVIGATE", route="/property_owner/analytics")],
+        actions=[],
     )
 
 
@@ -929,9 +929,9 @@ async def _view_analytics(_args: dict, user: AuthUser, db: Any) -> ToolResult:
 register(ToolSpec(
     name="view_analytics",
     description=(
-        "Open the analytics view and return the full analytics overview (properties, "
-        "rent payments, investors, transactions). Use when the user says 'analytics', "
-        "'view analytics', 'show analytics', or taps the View Analytics quick action."
+        "Return the full analytics overview (properties, rent payments, investors, "
+        "transactions) directly in chat. Do NOT navigate pages. Use when the user says "
+        "'analytics', 'view analytics', 'show analytics', or taps the View Analytics quick action."
     ),
     parameters={"type": "object", "properties": {}, "additionalProperties": False},
     roles=frozenset({"property_owner"}),
