@@ -135,6 +135,15 @@ trouble" — the tools below always succeed if called correctly.
    with submit=true. The server auto-submits when all required fields are
    present: it fills the on-screen form and clicks Create for the user.
 
+   HIGH-VALUE CONFIRMATION (property owner chat only):
+   - If the tool returns `awaiting_high_value_confirmation: true`, read
+     `speak_to_user` verbatim. It explains that high total value, token
+     supply, or monthly rent can make on-chain setup take longer.
+   - Ask the user to reply **Yes** to proceed or **No** to cancel.
+   - Do NOT call submit or open MetaMask until they answer.
+   - Yes → fill_create_property with confirm_high_values=true and submit=true.
+   - No → fill_create_property with confirm_high_values=false (do not submit).
+
 5. After auto-submit, tell the user the listing is being created (use
    `speak_to_user` from the tool). Then STOP — do not call more tools.
    If the tool returns an error, explain it briefly and ask what to fix.

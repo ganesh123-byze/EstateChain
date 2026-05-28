@@ -23,10 +23,12 @@ from typing import Any, Awaitable, Callable
 from fastapi import HTTPException
 
 from backend.ai.workflow_parsers import (
+    assess_high_value_create_property,
     assistant_prompted_for_create_field,
     is_generic_create_property_intent,
     normalize_create_property_accumulated,
     normalize_create_property_field,
+    parse_yes_no_confirmation,
 )
 from backend.ai.investor_guards import (
     claim_tool_blocked_message,
@@ -1671,6 +1673,8 @@ def _mark_create_property_completed(property_name: str = "") -> None:
             "filled": {},
             "next_field": "name",
             "last_created_name": (property_name or "").strip(),
+            "awaiting_high_value_confirmation": False,
+            "high_values_confirmed": False,
         },
     )
 
@@ -1704,6 +1708,8 @@ async def _start_create_property(_args: dict, _user: AuthUser, _db: Any) -> Tool
             "filled": filled,
             "next_field": next_field or "name",
             "submitted": False,
+            "awaiting_high_value_confirmation": False,
+            "high_values_confirmed": False,
         },
     )
     focus_field = next_field or "name"
@@ -1940,6 +1946,8 @@ def _build_fill_workflow(
     }
     if modal == _CREATE_PROPERTY_MODAL:
         session_payload["awaiting_new_property"] = False
+        session_payload.setdefault("awaiting_high_value_confirmation", False)
+        session_payload.setdefault("high_values_confirmed", False)
     _set_workflow_session(modal, session_payload)
     return ToolResult(
         ok=True,
@@ -1976,6 +1984,119 @@ def _create_property_success_message(name: str) -> str:
     if clean:
         return f"Property '{clean}' created successfully."
     return "Property created successfully."
+
+
+def _resolve_create_high_value_confirmation(
+    args: dict, session: dict[str, Any]
+) -> bool | None:
+    """Yes/No for high-value create: explicit tool arg beats last user utterance."""
+    if "confirm_high_values" in args and args.get("confirm_high_values") is not None:
+        return bool(args.get("confirm_high_values"))
+    if not session.get("awaiting_high_value_confirmation"):
+        return None
+    for msg in reversed(_current_history() or []):
+        if _message_role(msg) not in ("human", "user"):
+            continue
+        text = _message_content(msg)
+        if not text:
+            continue
+        yn = parse_yes_no_confirmation(text)
+        if yn is not None:
+            return yn
+    return None
+
+
+def _gate_high_value_create_submit(
+    accumulated: dict[str, str],
+    args: dict,
+    session: dict[str, Any],
+) -> ToolResult | None:
+    """Block auto-submit until the user confirms high values (Yes) or cancels (No)."""
+    if session.get("high_values_confirmed"):
+        return None
+
+    assessment = assess_high_value_create_property(accumulated)
+    if not assessment.get("is_high"):
+        return None
+
+    confirm = _resolve_create_high_value_confirmation(args, session)
+
+    if confirm is False:
+        _set_workflow_session(
+            _CREATE_PROPERTY_MODAL,
+            {
+                "in_progress": True,
+                "filled": accumulated,
+                "next_field": None,
+                "submitted": False,
+                "awaiting_high_value_confirmation": False,
+                "high_values_confirmed": False,
+                "awaiting_new_property": False,
+            },
+        )
+        speak = (
+            "Understood — I have not submitted the property. "
+            "Tell me which value you would like to change (name, location, "
+            "total value, token supply, symbol, or monthly rent), or say "
+            "you want to start over."
+        )
+        return ToolResult(
+            ok=True,
+            data={
+                "filled": accumulated,
+                "missing": [],
+                "submitted": False,
+                "cancelled": True,
+                "high_value_confirmation": "declined",
+                "speak_to_user": speak,
+                "instruction": (
+                    "Tell the user the create was cancelled. Ask what they want "
+                    "to adjust, then call fill_create_property with the corrected fields."
+                ),
+            },
+            actions=[],
+        )
+
+    if confirm is True:
+        _set_workflow_session(
+            _CREATE_PROPERTY_MODAL,
+            {
+                "in_progress": True,
+                "filled": accumulated,
+                "next_field": None,
+                "submitted": False,
+                "awaiting_high_value_confirmation": False,
+                "high_values_confirmed": True,
+                "awaiting_new_property": False,
+            },
+        )
+        return None
+
+    _set_workflow_session(
+        _CREATE_PROPERTY_MODAL,
+        {
+            "in_progress": True,
+            "filled": accumulated,
+            "next_field": None,
+            "submitted": False,
+            "awaiting_high_value_confirmation": True,
+            "high_values_confirmed": False,
+            "awaiting_new_property": False,
+        },
+    )
+    return ToolResult(
+        ok=True,
+        data={
+            "filled": accumulated,
+            "missing": [],
+            "submitted": False,
+            "awaiting_high_value_confirmation": True,
+            "high_value_reasons": assessment.get("reasons") or [],
+            "speak_to_user": str(assessment.get("speak_to_user") or ""),
+            "instruction": str(assessment.get("instruction") or ""),
+        },
+        actions=[],
+    )
 
 
 def _create_property_ui_submit_actions(
@@ -2082,6 +2203,14 @@ async def _fill_create_property(args: dict, user: AuthUser, db: Any) -> ToolResu
     data["filled"] = accumulated
     submitted = bool(args.get("submit")) and not data.get("missing")
 
+    if submitted or (not data.get("missing") and pre_session.get("awaiting_high_value_confirmation")):
+        gate_session = {**pre_session, **(_get_workflow_session(_CREATE_PROPERTY_MODAL) or {})}
+        gated = _gate_high_value_create_submit(accumulated, args, gate_session)
+        if gated is not None:
+            return gated
+        if not submitted:
+            submitted = True
+
     if submitted:
         property_name = str(accumulated.get("name") or "property")
         data.update(
@@ -2166,7 +2295,20 @@ register(ToolSpec(
             "token_supply": {"type": "string", "description": "Total number of ownership tokens to mint, e.g. '10000'."},
             "token_symbol": {"type": "string", "description": "Short ticker for the token, e.g. 'OCEAN'."},
             "monthly_rent_eth": {"type": "string", "description": "Optional monthly rent in ETH."},
-            "submit": {"type": "boolean", "description": "Set to true on the FINAL call, once all 5 required fields are filled. Emits SUBMIT_FORM so the frontend clicks the Create button visibly."},
+            "submit": {
+                "type": "boolean",
+                "description": (
+                    "Set to true on the FINAL call once all 5 required fields are filled. "
+                    "Emits SUBMIT_FORM so the frontend clicks Create."
+                ),
+            },
+            "confirm_high_values": {
+                "type": "boolean",
+                "description": (
+                    "Only when awaiting_high_value_confirmation is true in the tool result: "
+                    "true = user said Yes, proceed with create; false = user said No, cancel."
+                ),
+            },
         },
         "additionalProperties": False,
     },

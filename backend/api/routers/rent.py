@@ -115,7 +115,26 @@ def _tenant_wallet_rent_period_status(cursor, tenant_wallet: str, property_id: i
 def _ensure_rent_chain_ready_for_payment(cursor, property_item: dict, property_id: int) -> int:
     """Register property, sync rent amount, and sync investors before tenant pays."""
     ensure_rent_property_registered(cursor, property_item, property_id)
-    sync_rent_amount_to_contract(cursor, property_item, property_id)
+    try:
+        sync_rent_amount_to_contract(cursor, property_item, property_id)
+    except Exception as exc:  # noqa: BLE001
+        # Tenant payments should not be blocked by a stale/oversized DB rent value
+        # if the on-chain rent is already active and non-zero.
+        err = str(exc).lower()
+        if "rent amount too high" in err:
+            info = get_rent_property_info(property_id)
+            onchain_rent = int(info.get("monthly_rent_wei") or 0)
+            if info.get("active") and onchain_rent > 0:
+                LOGGER.warning(
+                    "tenant_sync rent-too-high fallback property_id=%s db_rent=%s onchain_rent=%s",
+                    property_id,
+                    property_item.get("monthly_rent_wei"),
+                    onchain_rent,
+                )
+            else:
+                raise
+        else:
+            raise
     synced = sync_investors_to_contract(cursor, property_id)
     return len(synced)
 

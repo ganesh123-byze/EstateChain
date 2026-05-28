@@ -586,6 +586,25 @@ def format_transaction_row(row: dict) -> dict:
 
 # ── Rent helpers ──────────────────────────────────────────────────────
 
+# Must match RentDistribution.sol: require(rentWei <= 100 ether, "Rent amount too high")
+MAX_ONCHAIN_MONTHLY_RENT_WEI = 100 * 10**18
+
+
+def validate_monthly_rent_for_chain(rent_wei: int) -> None:
+    """Reject rent values that will always revert on RentDistribution.setMonthlyRent."""
+    if rent_wei <= 0:
+        return
+    if rent_wei > MAX_ONCHAIN_MONTHLY_RENT_WEI:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Monthly rent exceeds the on-chain limit of 100 ETH. "
+                "Lower the monthly rent to 100 ETH or less, or leave rent empty and "
+                "set it later from the property card."
+            ),
+        )
+
+
 def get_or_create_tenant(cursor, wallet_address: str) -> int:
     checksum = get_web3().to_checksum_address(wallet_address)
     cursor.execute("SELECT id FROM tenants WHERE LOWER(wallet_address) = LOWER(%s)", (checksum,))
@@ -599,7 +618,9 @@ def get_or_create_tenant(cursor, wallet_address: str) -> int:
     return int(cursor.fetchone()["id"])
 
 
-def ensure_rent_property_registered(cursor, property_item: dict, property_id: int) -> None:
+def ensure_rent_property_registered(
+    cursor, property_item: dict, property_id: int, *, fast: bool = False
+) -> None:
     """Register the property in the RentDistribution singleton if not already active."""
     from backend.services.blockchain import platform_deployer_mismatch
 
@@ -619,7 +640,7 @@ def ensure_rent_property_registered(cursor, property_item: dict, property_id: in
             status_code=400, detail="Property has no token contract deployed"
         )
     try:
-        register_property_for_rent(property_id, token_address)
+        register_property_for_rent(property_id, token_address, fast=fast)
     except Exception as exc:
         err = str(exc)
         if "not the owner" in err or "Ownable" in err:
@@ -683,11 +704,73 @@ def sync_investors_to_contract(cursor, property_id: int) -> list[str]:
     return new_investors
 
 
+def _rent_amount_too_high_http_exception(exc: Exception) -> HTTPException | None:
+    err = str(exc).lower()
+    if "rent amount too high" not in err:
+        return None
+    return HTTPException(
+        status_code=409,
+        detail=(
+            "Monthly rent exceeds the on-chain limit of 100 ETH. "
+            "Property was saved — set rent to 100 ETH or less, then use "
+            "Sync Rent Chain on the property."
+        ),
+    )
+
+
+def sync_rent_chain_for_new_property(
+    cursor, property_item: dict, property_id: int
+) -> int:
+    """Minimal on-chain rent setup when finalizing a newly created property.
+
+    Skips investor backfill (no holders yet) and avoids multi-attempt fee-bump
+    retries so create-property does not stall on the rent-sync progress row.
+    """
+    rent_wei = int(Decimal(property_item.get("monthly_rent_wei") or 0))
+    if rent_wei <= 0:
+        return 0
+
+    validate_monthly_rent_for_chain(rent_wei)
+
+    try:
+        info = get_rent_property_info(property_id)
+    except Exception:
+        info = {"active": False, "monthly_rent_wei": 0}
+
+    if info.get("active") and int(info.get("monthly_rent_wei") or 0) == rent_wei:
+        return rent_wei
+
+    if not info.get("active"):
+        require_property_token(property_item)
+        ensure_rent_property_registered(cursor, property_item, property_id, fast=True)
+        try:
+            info = get_rent_property_info(property_id)
+        except Exception:
+            info = {"active": True, "monthly_rent_wei": 0}
+
+    onchain_rent = int(info.get("monthly_rent_wei") or 0)
+    if onchain_rent != rent_wei:
+        try:
+            set_monthly_rent(property_id, rent_wei, use_retry=False)
+        except Exception as exc:
+            too_high = _rent_amount_too_high_http_exception(exc)
+            if too_high:
+                refreshed = get_rent_property_info(property_id)
+                if refreshed.get("active") and int(refreshed.get("monthly_rent_wei") or 0) > 0:
+                    return int(refreshed.get("monthly_rent_wei") or 0)
+                raise too_high from exc
+            raise
+
+    return rent_wei
+
+
 def sync_rent_amount_to_contract(cursor, property_item: dict, property_id: int) -> int:
     """Ensure the RentDistribution contract has the same monthly rent as the DB."""
     rent_wei = int(Decimal(property_item.get("monthly_rent_wei") or 0))
     if rent_wei <= 0:
         return 0
+
+    validate_monthly_rent_for_chain(rent_wei)
 
     try:
         info = get_rent_property_info(property_id)
@@ -699,8 +782,18 @@ def sync_rent_amount_to_contract(cursor, property_item: dict, property_id: int) 
         ensure_rent_property_registered(cursor, property_item, property_id)
         info = {"active": True, "monthly_rent_wei": 0}
 
-    if int(info.get("monthly_rent_wei") or 0) != rent_wei:
-        set_monthly_rent(property_id, rent_wei)
+    onchain_rent = int(info.get("monthly_rent_wei") or 0)
+    if onchain_rent != rent_wei:
+        try:
+            set_monthly_rent(property_id, rent_wei, use_retry=False)
+        except Exception as exc:
+            too_high = _rent_amount_too_high_http_exception(exc)
+            if too_high:
+                refreshed = get_rent_property_info(property_id)
+                if refreshed.get("active") and int(refreshed.get("monthly_rent_wei") or 0) > 0:
+                    return int(refreshed.get("monthly_rent_wei") or 0)
+                raise too_high from exc
+            raise
 
     return rent_wei
 

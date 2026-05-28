@@ -303,6 +303,13 @@ def send_contract_tx(contract, function_name: str, args: list[Any]) -> dict:
     return build_and_send(tx)
 
 
+def send_contract_tx_once(contract, function_name: str, args: list[Any]) -> dict:
+    """Single-attempt contract tx for latency-sensitive setup paths (e.g. create-property rent sync)."""
+    fn = getattr(contract.functions, function_name)(*args)
+    tx = fn.build_transaction({"from": get_deployer_account().address})
+    return build_and_send_with_retry(tx, max_attempts=1, bump_pct=0)
+
+
 def send_contract_tx_with_retry(contract, function_name: str, args: list[Any], max_attempts: int = 3, bump_pct: int = 30) -> dict:
     """Send a contract transaction with simple retry + fee bump on failure.
 
@@ -397,15 +404,20 @@ def get_rent_distribution_contract():
     return get_contract("RentDistribution", get_rent_distribution_address())
 
 
-def register_property_for_rent(property_id: int, token_address: str) -> dict:
+def register_property_for_rent(
+    property_id: int, token_address: str, *, fast: bool = False
+) -> dict:
     contract = get_rent_distribution_contract()
-    return send_contract_tx(contract, "registerProperty", [int(property_id), token_address])
+    sender = send_contract_tx_once if fast else send_contract_tx
+    return sender(contract, "registerProperty", [int(property_id), token_address])
 
 
-def set_monthly_rent(property_id: int, rent_wei: int) -> dict:
+def set_monthly_rent(property_id: int, rent_wei: int, *, use_retry: bool = True) -> dict:
     contract = get_rent_distribution_contract()
-    # Use a retrying send to handle replacement/underpriced errors
-    return send_contract_tx_with_retry(contract, "setMonthlyRent", [int(property_id), int(rent_wei)])
+    args = [int(property_id), int(rent_wei)]
+    if use_retry:
+        return send_contract_tx_with_retry(contract, "setMonthlyRent", args)
+    return send_contract_tx(contract, "setMonthlyRent", args)
 
 
 def add_investor_to_rent(property_id: int, investor_address: str) -> dict:

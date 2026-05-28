@@ -22,8 +22,8 @@ from backend.api._helpers import (
     lock_property,
     property_needs_token_deployment,
     require_property_token,
-    sync_investors_to_contract,
-    sync_rent_amount_to_contract,
+    sync_rent_chain_for_new_property,
+    validate_monthly_rent_for_chain,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -112,9 +112,7 @@ def _finalize_step_sync_rent(db, property_id: int) -> None:
         prop = lock_property(cursor, property_id)
         if not prop:
             raise HTTPException(status_code=404, detail="Property not found")
-        rent_wei = sync_rent_amount_to_contract(cursor, prop, property_id)
-        if rent_wei:
-            sync_investors_to_contract(cursor, property_id)
+        sync_rent_chain_for_new_property(cursor, prop, property_id)
         db.commit()
     except HTTPException:
         db.rollback()
@@ -227,6 +225,16 @@ async def create_property_stream(
     )
     owner_wallet = normalize_address(user.wallet_address)
 
+    # Fail fast before token deploy / mint when rent exceeds the on-chain cap.
+    rent_wei_for_create = 0
+    if monthly_rent_wei not in (None, "", "0"):
+        try:
+            rent_wei_for_create = int(monthly_rent_wei)
+        except (TypeError, ValueError):
+            rent_wei_for_create = 0
+        if rent_wei_for_create > 0:
+            validate_monthly_rent_for_chain(rent_wei_for_create)
+
     async def gen() -> AsyncIterator[str]:
         property_id: int | None = None
         cursor = db.cursor(dictionary=True)
@@ -277,6 +285,8 @@ async def create_property_stream(
                     return str(detail.get("message") or detail)
                 return None
             text = str(detail)
+            if "rent amount too high" in text.lower() or "exceeds the on-chain limit" in text.lower():
+                return text
             if "DEPLOYER_CONTRACT_MISMATCH" in text or "not the owner" in text or "Ownable" in text:
                 return text
             return None
@@ -296,6 +306,7 @@ async def create_property_stream(
                 if skip_msg:
                     LOGGER.warning("create_property_stream stage %s skipped: %s", intent, skip_msg)
                     yield _sse({"step": "rent_sync_skipped", "detail": skip_msg})
+                    yield _sse({"step": "rent_synced"})
                     return
                 LOGGER.warning("create_property_stream stage %s failed: %s", intent, exc.detail)
                 yield _sse({"step": "error", "detail": str(exc.detail)})
@@ -313,13 +324,19 @@ async def create_property_stream(
             async for ev in run_stage("finalizing_inventory", "inventory_done",
                                       lambda: _finalize_step_finalize_inventory(db, property_id)):
                 yield ev
-            async for ev in run_stage(
-                "syncing_rent",
-                "rent_synced",
-                lambda: _finalize_step_sync_rent(db, property_id),
-                allow_rent_sync_skip=True,
-            ):
-                yield ev
+
+            # Fast path: no monthly rent — skip blocking RPC work entirely.
+            if rent_wei_for_create <= 0:
+                yield _sse({"step": "syncing_rent"})
+                yield _sse({"step": "rent_synced"})
+            else:
+                async for ev in run_stage(
+                    "syncing_rent",
+                    "rent_synced",
+                    lambda: _finalize_step_sync_rent(db, property_id),
+                    allow_rent_sync_skip=True,
+                ):
+                    yield ev
         except Exception:
             return  # error event was already yielded inside run_stage
 
